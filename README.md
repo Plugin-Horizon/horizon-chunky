@@ -1,14 +1,20 @@
 # horizon-chunky
 
-> **Unofficial Rust port of Chunky for the Horizon server (https://github.com/horizon-rust/horizon). Not affiliated with or endorsed by the Chunky authors.**
-
-World pre-generation for [Horizon](https://github.com/horizon-rust/horizon) dedicated servers, as a native mod
-(horizon-mixins bundle). It is a port of the Paper plugin **Chunky**: the commands, messages, shapes, patterns and
-config follow Chunky's source.
+> **Unofficial Rust port of Chunky for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the Chunky authors.**
 
 Derived from Chunky (https://github.com/pop4959/Chunky, GPL-3.0). Copyright of the original: pop4959 and the Chunky
 contributors. Licence: GNU GPL version 3, see `LICENSE`; attribution in `NOTICE`. Not affiliated with Chunky or its
 author.
+
+> **Built for and working only with [arismoko/horizon](https://github.com/arismoko/horizon)** (the Horizon fork that carries the mod API). [horizon-rust/horizon](https://github.com/horizon-rust/horizon) is experimental for mods and not supported: the earlier version for its native hooks / horizon-mixins is frozen on the `horizon-plain` branch (work stopped on 2026-11-12).
+
+## Which Horizon
+
+This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `horizon-mod-api`, `src/lib.rs` with the hooks, and the plugin logic in the `core/` crate (plain Rust, no engine needed for its tests).
+
+- Pin: `[native] horizon = "54090ee36c4e2c7b43b66db864220c577b94b7e0"` in `horizon-mod.toml` (game `26.3`). That is a development build of arismoko/horizon `main` plus mod API additions that are not all merged upstream yet, so a stock `main` may lack some host methods this mod calls until they land.
+- It compiled and loaded on that build and was smoke-tested there; it has not seen a long run with real players. Treat it as experimental.
+- Feature descriptions below were written for the earlier horizon-rust version; where they name engine calls (`native_*`) or old file paths, read them as descriptions only. The Known gaps list is current.
 
 ## Commands
 
@@ -31,7 +37,7 @@ one or two; the side word of `trim` comes after both radii. `cancel`, `start` ov
 `chunky confirm` within 60 seconds.
 
 Not ported: `limit`, `debug map`, the `border` subcommands (ChunkyBorder is not on Horizon), the trim filter
-`unmodified` and inhabited ranges. See `GAPS.md`.
+`unmodified` and inhabited ranges. See the Known gaps section.
 
 ## Shapes and patterns
 
@@ -69,16 +75,16 @@ first: deleted chunks cannot be restored.
 
 ## Build
 
-The pure logic lives in `mod/core` (no game types; `cargo test` there). To build into an engine, export Horizon source,
-copy `mod/` (without `target/`) as `mods/chunky/`, run `horizon-mixins apply --workspace SRC --mods MODS --out STAGE`,
-then `cargo build --profile fast -p horizon-client --no-default-features` in `STAGE`. `horizon_revision` in
-`mod/horizon-mixin.toml` pins the Horizon commit it was built on.
+Build it as a native trait mod with arismoko's launcher (see the "native mods" how-to in the arismoko/horizon docs):
 
-## Status
+```sh
+horizon-launcher native-build <path to this folder> --server-output <dir> --version <tag> --trust-native-code
+```
 
-The round-3 port (commands, messages, shapes, patterns, config) has not been built or run in an engine yet. `STATUS.md`
-lists what to check first; `GAPS.md` lists what differs from Chunky.
+`--trust-native-code` is your consent to compile and run this code inside the server. The logic crate tests run without the engine: `(cd core && cargo test)`.
 
-## Contributing
+## Known gaps
 
-Pull requests and improvements are always welcome! Open an issue or a PR -- direct pushes to main are disabled, every change goes through review.
+What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
+
+- `chunky.command.<sub>` permission nodes are not checked: every sub-command needs operator level 2, so a permissions mod cannot grant a single sub-command.
