@@ -1,9 +1,0 @@
-[package]
-name = "horizon-chunky-core"
-version = "0.1.0"
-edition = "2021"
-license = "GPL-3.0"
-
-[dependencies]
-# The version in the Horizon Cargo.lock the bundle targets (region files are zlib or gzip).
-flate2 = "1.1"
