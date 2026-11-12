@@ -2,7 +2,7 @@ id = "chunky"
 name = "Chunky"
 version = "0.1.0"
 description = "World pre-generation: /chunky start, pause, continue, cancel, trim; ring, spiral, region and csv patterns."
-authors = ["CoreSMP"]
+authors = ["Plugin-Horizon contributors"]
 api = "0.2"
 capabilities = ["registries"]
 
