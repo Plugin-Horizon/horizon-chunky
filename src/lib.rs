@@ -14,12 +14,13 @@
 //!   any world opens, and the tasks are saved at server stop, as in the Horizon port. No `register_configs`, so no
 //!   default file is written.
 use horizon_chunky_core as chunky;
-use horizon_chunky_core::engine::{Who, canon_world};
+use horizon_chunky_core::engine::{Who, canon_world, set_level_name};
+use mod_api::text::TextStyle;
 use mod_api::{
     ChunkRef, Command, CommandArgumentValue, CommandSource, Flow, Hooks, HostSide, LevelRef,
-    LevelTickPostEvent, LevelTickPreEvent, RegisterCommandsEvent, Registrar, RegistrationContext,
-    RunModCommandEvent, ServerAboutToStartEvent, ServerHost, ServerStoppingEvent, Text,
-    TicketController, TicketOwner,
+    LevelTickPostEvent, LevelTickPreEvent, PlayerCommandEvent, RegisterCommandsEvent, Registrar,
+    RegistrationContext, RunModCommandEvent, PlayerCommandsSentEvent, ServerAboutToStartEvent, ServerHost, ServerStoppingEvent,
+    Text, TicketController, TicketOwner,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -28,6 +29,18 @@ use std::sync::{Mutex, OnceLock};
 /// The owner the engine's tickets are held under. No entity or block is behind it: validation is off, so nothing
 /// checks that a block is there.
 const OWNER: TicketOwner = TicketOwner::Block([0, 0, 0]);
+/// plugin.yml: `chunky.command` (the root, default op) and the operator level the usages are registered at.
+const ROOT_NODE: &str = "chunky.command";
+const LEVEL: u8 = 2;
+/// Bukkit's permission message, which plugin.yml gives every permission-gated command (no `permission-message`).
+const NO_PERMISSION: &str = "I'm sorry, but you do not have permission to perform this command. Please contact the server administrators if you believe that this is in error.";
+
+/// The red permission message for a player without the node.
+fn no_permission() -> Text {
+    let mut style = TextStyle::default();
+    style.color = Some("#FF5555".to_string());
+    Text::literal(NO_PERMISSION).with_style(style)
+}
 
 #[derive(Default)]
 struct Mod {
@@ -141,32 +154,34 @@ fn usages() -> Vec<String> {
     usages
 }
 
+/// Every subcommand word.
+const SUBS: [&str; 22] = [
+    "cancel",
+    "center",
+    "confirm",
+    "continue",
+    "corners",
+    "debug",
+    "help",
+    "limit",
+    "pattern",
+    "pause",
+    "progress",
+    "quiet",
+    "radius",
+    "reload",
+    "selection",
+    "shape",
+    "silent",
+    "spawn",
+    "start",
+    "trim",
+    "world",
+    "worldborder",
+];
+
 /// The permission node of a subcommand, `chunky.command.<sub>` (Paper's `plugin.yml`).
 fn permission_node(sub: &str) -> Option<String> {
-    const SUBS: [&str; 22] = [
-        "cancel",
-        "center",
-        "confirm",
-        "continue",
-        "corners",
-        "debug",
-        "help",
-        "limit",
-        "pattern",
-        "pause",
-        "progress",
-        "quiet",
-        "radius",
-        "reload",
-        "selection",
-        "shape",
-        "silent",
-        "spawn",
-        "start",
-        "trim",
-        "world",
-        "worldborder",
-    ];
     let sub = sub.to_ascii_lowercase();
     SUBS.contains(&sub.as_str())
         .then(|| format!("chunky.command.{sub}"))
@@ -198,13 +213,57 @@ impl Hooks for Mod {
         // literal: a permissions mod can hand one subcommand to a non-operator; level 2 decides when none answers.
         // The bare `/chunky` (help) has no node, so it does not gate the subcommands.
         for usage in usages() {
-            let command = Command::op(&usage, 2);
             let sub = usage.split(' ').nth(1).filter(|w| !w.starts_with('<') && !w.starts_with('['));
-            event.commands.push(match sub.and_then(permission_node) {
-                Some(node) => command.with_node(&node),
-                None => command,
-            });
+            let node = sub.and_then(permission_node);
+            // plugin.yml gives Chunky the alias `cy`: the same usages under that label.
+            for label in ["chunky", "cy"] {
+                let command = Command::op(&usage.replacen("chunky", label, 1), 2);
+                event.commands.push(match &node {
+                    Some(node) => command.with_node(node),
+                    None => command,
+                });
+            }
         }
+    }
+
+    /// Tab completion: a player with no chunky node at all (and below the operator level) is not offered
+    /// `chunky` or `cy` (Bukkit hides a command the sender may not run).
+    fn player_commands_sent(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandsSentEvent<'_>) {
+        let h: &dyn ServerHost = &*host;
+        let may = h.player(event.player).is_some_and(|p| {
+            p.permission_level(h).unwrap_or(0) >= LEVEL
+                || p.permission_value(h, ROOT_NODE) == Some(true)
+                || SUBS.iter().any(|s| p.permission_value(h, &format!("chunky.command.{s}")) == Some(true))
+        });
+        if !may {
+            event.names.retain(|n| !matches!(n.to_ascii_lowercase().as_str(), "chunky" | "cy"));
+        }
+    }
+
+    /// A player without the node gets Bukkit's permission message, as the original. The tree already leaves those
+    /// usages out for them (`with_node`); this line answers what the tree no longer shows.
+    fn player_command(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandEvent<'_>) -> Flow {
+        let mut words = event.command.split_whitespace();
+        let root = words.next().unwrap_or("").to_ascii_lowercase();
+        if root != "chunky" && root != "cy" {
+            return Flow::Continue;
+        }
+        // The subcommand's node as `register_commands` gives it; the bare command and unknown words use the root's.
+        let node = words
+            .next()
+            .and_then(permission_node)
+            .unwrap_or_else(|| ROOT_NODE.to_string());
+        let h: &dyn ServerHost = &*host;
+        let allowed = h.player(event.player).is_some_and(|p| {
+            let level = p.permission_level(h).unwrap_or(0);
+            p.permission_value(h, &node).unwrap_or(level >= LEVEL)
+        });
+        if allowed {
+            return Flow::Continue;
+        }
+        event.replies.push(no_permission());
+        event.cancelled = true;
+        Flow::Cancel
     }
 
     fn run_mod_command(
@@ -212,15 +271,13 @@ impl Hooks for Mod {
         host: &mut dyn ServerHost,
         event: &mut RunModCommandEvent<'_>,
     ) -> Flow {
-        if event.command.literals.first().map(String::as_str) != Some("chunky") {
+        if !matches!(event.command.literals.first().map(String::as_str), Some("chunky" | "cy")) {
             return Flow::Continue;
         }
         // The line as typed: literals, then the arguments in parse order. `text` is the rest of the line, last.
-        let line = event
-            .command
-            .literals
-            .iter()
-            .cloned()
+        // The alias `cy` is parsed as `chunky`.
+        let line = std::iter::once("chunky".to_owned())
+            .chain(event.command.literals.iter().skip(1).cloned())
             .chain(
                 event
                     .command
@@ -274,6 +331,7 @@ impl Hooks for Mod {
                 .unwrap_or_else(|_| "world".into()),
         );
         *lock(&self.world_dir) = Some(world_dir.clone());
+        set_level_name(&world_dir.to_string_lossy());
         // A trim confirmed during the last run, applied before any world (and so any region file) is open.
         for l in chunky::server_about_to_start(config) {
             log(&l);
