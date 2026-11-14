@@ -202,9 +202,48 @@ pub fn hms(s: u64) -> String {
     format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
 }
 
-/// `world`, `overworld`, `minecraft:overworld`... to Chunky's world names.
+/// The level name (the world folder, Paper's `level-name`), set when the server starts. Until then `world`.
+static LEVEL: std::sync::RwLock<String> = std::sync::RwLock::new(String::new());
+
+/// Remembers the level name, so the worlds are named as Bukkit names them (`<level>`, `<level>_nether`,
+/// `<level>_the_end`). The core keeps the canonical `world`, `world_nether`, `world_the_end` inside.
+pub fn set_level_name(name: &str) {
+    if let Ok(mut level) = LEVEL.write() {
+        *level = name.to_string();
+    }
+}
+
+fn level_name() -> String {
+    match LEVEL.read() {
+        Ok(level) if !level.is_empty() => level.clone(),
+        _ => "world".to_string(),
+    }
+}
+
+/// The Bukkit name of a canonical world (`world` -> the level name, `world_nether` -> `<level>_nether`).
+pub fn display_world(canon: &str) -> String {
+    let level = level_name();
+    match canon {
+        "world_nether" => format!("{level}_nether"),
+        "world_the_end" => format!("{level}_the_end"),
+        _ => level,
+    }
+}
+
+/// `world`, the level name, `overworld`, `minecraft:overworld`... to the canonical world names.
 pub fn canon_world(name: &str) -> Option<&'static str> {
-    match name.to_ascii_lowercase().as_str() {
+    let lower = name.to_ascii_lowercase();
+    let level = level_name().to_ascii_lowercase();
+    if lower == level {
+        return Some("world");
+    }
+    if lower == format!("{level}_nether") {
+        return Some("world_nether");
+    }
+    if lower == format!("{level}_the_end") {
+        return Some("world_the_end");
+    }
+    match lower.as_str() {
         "world" | "overworld" | "minecraft:overworld" => Some("world"),
         "world_nether" | "the_nether" | "nether" | "minecraft:the_nether" => Some("world_nether"),
         "world_the_end" | "the_end" | "end" | "minecraft:the_end" => Some("world_the_end"),
@@ -815,7 +854,7 @@ impl Engine {
             },
         };
         self.selected_world = target.clone();
-        vec![pre(format!("World changed to {target}."))]
+        vec![pre(format!("World changed to {}.", display_world(&target)))]
     }
 
     /// `worldborder [world]`: the border is read on the level's next tick (the glue asks for it there).
@@ -830,7 +869,7 @@ impl Engine {
         };
         self.selected_world = w.clone();
         self.border_request = Some(w.clone());
-        vec![pre(format!("Reading the world border of {w} on its next tick..."))]
+        vec![pre(format!("Reading the world border of {} on its next tick...", display_world(&w)))]
     }
 
     /// `center [x z]`: the centre of the selection; with no numbers, the player's own position.
@@ -972,7 +1011,7 @@ impl Engine {
         let s = &self.selection;
         vec![
             pre("Current selection"),
-            format!("World: {}", self.selected_world),
+            format!("World: {}", display_world(&self.selected_world)),
             format!("Shape: {}", s.shape.name()),
             format!("Center: {}, {}", number(s.cx), number(s.cz)),
             if s.radius == s.radius_z {
@@ -1120,7 +1159,12 @@ fn pre(text: impl AsRef<str>) -> String {
 }
 
 fn world_not_found(name: &str) -> String {
-    pre(format!("World {name} not found. Available worlds: world, world_nether, world_the_end"))
+    pre(format!(
+        "World {name} not found. Available worlds: {}, {}, {}",
+        display_world("world"),
+        display_world("world_nether"),
+        display_world("world_the_end")
+    ))
 }
 
 fn shape_not_found(name: &str) -> String {
