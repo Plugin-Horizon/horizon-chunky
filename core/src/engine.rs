@@ -41,7 +41,8 @@ impl Default for Config {
             silent: false,
             // Measured on a radius 1000 run (16129 chunks, 5 workers): 32 -> 180 cps, 64-128 -> 260 cps, 256 -> 234 cps.
             max_in_flight: 128,
-            tick_budget_ms: 35,
+            // A full tick: below it the level keeps 20 TPS. Radius 1000: 35 ms -> 265 cps, 50 ms -> 278+ cps, ticks still 8 ms avg.
+            tick_budget_ms: 50,
             chunk_timeout_ticks: 400,
             force_load_existing_chunks: false,
         }
@@ -1405,8 +1406,9 @@ mod tests {
     }
 
     #[test]
-    fn tickets_go_back_in_order_and_the_default_window_is_128() {
+    fn tickets_go_back_in_order_and_the_defaults_are_128_and_50_ms() {
         assert_eq!(Config::default().max_in_flight, 128);
+        assert_eq!(Config::default().tick_budget_ms, 50);
         let mut e = engine(None);
         e.cfg.max_in_flight = 4;
         e.command("chunky start world square 0 0 100", &Who::default(), 0);
