@@ -39,7 +39,8 @@ impl Default for Config {
             continue_on_restart: false,
             update_interval: 1,
             silent: false,
-            max_in_flight: 32,
+            // Measured on a radius 1000 run (16129 chunks, 5 workers): 32 -> 180 cps, 64-128 -> 260 cps, 256 -> 234 cps.
+            max_in_flight: 128,
             tick_budget_ms: 35,
             chunk_timeout_ticks: 400,
             force_load_existing_chunks: false,
@@ -430,6 +431,8 @@ impl Engine {
                 t.elapsed_ms += now_ms.saturating_sub(last).min(1000);
             }
             t.last_ms = Some(now_ms);
+            // Tickets go back in order on purpose: releasing a loaded chunk behind a slower one drops neighbours the
+            // engine generated for it, and they are generated again later (radius 1000: 260 -> 244 cps, more CPU).
             while let Some(e) = t.inflight.front() {
                 let (c, ready, held) = (e.chunk, e.ready, e.held);
                 let timed_out = t.ticks.saturating_sub(e.since) > cfg.chunk_timeout_ticks;
@@ -1355,6 +1358,27 @@ mod tests {
         assert_eq!(a.release.len(), 4, "pre-loaded chunks are retired at once");
         e.chunk_unloaded("minecraft:overworld", a.release[0]);
         assert!(!e.loaded["minecraft:overworld"].contains(&a.release[0]));
+    }
+
+    #[test]
+    fn tickets_go_back_in_order_and_the_default_window_is_128() {
+        assert_eq!(Config::default().max_in_flight, 128);
+        let mut e = engine(None);
+        e.cfg.max_in_flight = 4;
+        e.command("chunky start world square 0 0 100", &Who::default(), 0);
+        let a = e.tick("minecraft:overworld", 0);
+        assert_eq!(a.hold.len(), 4);
+        // Every held chunk but the first loads: their neighbours stay loaded until the first one is done.
+        for &c in &a.hold[1..] {
+            e.chunk_loaded("minecraft:overworld", c);
+        }
+        let b = e.tick("minecraft:overworld", 50);
+        assert!(b.release.is_empty() && b.hold.is_empty(), "{b:?}");
+        assert_eq!(e.tasks["world"].done, 0);
+        e.chunk_loaded("minecraft:overworld", a.hold[0]);
+        let c = e.tick("minecraft:overworld", 100);
+        assert_eq!(c.release, a.hold);
+        assert_eq!(e.tasks["world"].done, 4);
     }
 
     #[test]
