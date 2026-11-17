@@ -10,8 +10,8 @@
 //! compacted. Each edited file is written as a copy and renamed over the old one; a file with no chunk left is deleted,
 //! and so is the `.mcc` file of a deleted chunk that had its data outside the region file.
 
-use crate::geom::{Chunk, Pattern, Selection, Shape};
-use crate::region::{self, KINDS};
+use crate::horizon_chunky_core::geom::{Chunk, Pattern, Selection, Shape};
+use crate::horizon_chunky_core::region::{self, KINDS};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -240,7 +240,7 @@ pub fn apply_pending(base: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::region::testutil::{nbt, write_region};
+    use crate::horizon_chunky_core::region::testutil::{nbt, write_region};
 
     fn tmp(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("chunky-trim-{}-{name}", std::process::id()));

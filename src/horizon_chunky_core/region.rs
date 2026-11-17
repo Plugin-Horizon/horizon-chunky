@@ -5,7 +5,7 @@
 //! four-byte timestamps; a chunk's record is a big-endian length, a compression byte (1 gzip, 2 zlib, 3 none, 4 lz4;
 //! +128 = the data lives in `c.<x>.<z>.mcc` beside the file) and the compressed NBT.
 
-use crate::geom::Chunk;
+use crate::horizon_chunky_core::geom::Chunk;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};

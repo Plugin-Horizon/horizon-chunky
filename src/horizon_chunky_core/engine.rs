@@ -1,9 +1,9 @@
 //! Tasks, commands and the per-tick work, without any game types so it can be tested.
 
-use crate::geom::{self, Chunk, ChunkList, Pattern, Selection, Shape};
-use crate::region::{self, ExistingIndex};
-use crate::task::{self, Saved};
-use crate::trim::{self, TrimJob};
+use crate::horizon_chunky_core::geom::{self, Chunk, ChunkList, Pattern, Selection, Shape};
+use crate::horizon_chunky_core::region::{self, ExistingIndex};
+use crate::horizon_chunky_core::task::{self, Saved};
+use crate::horizon_chunky_core::trim::{self, TrimJob};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};
@@ -1538,8 +1538,8 @@ mod tests {
     fn world_with_region(name: &str, chunks: &[(usize, &str)]) -> PathBuf {
         let d = tmp(name);
         let dim = d.join("dimensions/minecraft/overworld");
-        let nbts: Vec<(usize, Vec<u8>)> = chunks.iter().map(|(i, st)| (*i, crate::region::testutil::nbt(st, 0))).collect();
-        crate::region::testutil::write_region(&crate::region::region_path(&dim, "region", (0, 0)), &nbts);
+        let nbts: Vec<(usize, Vec<u8>)> = chunks.iter().map(|(i, st)| (*i, crate::horizon_chunky_core::region::testutil::nbt(st, 0))).collect();
+        crate::horizon_chunky_core::region::testutil::write_region(&crate::horizon_chunky_core::region::region_path(&dim, "region", (0, 0)), &nbts);
         d
     }
 

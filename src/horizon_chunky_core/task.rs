@@ -1,6 +1,6 @@
 //! Saved tasks: one `<world>.properties` file per world, `key=value` lines.
 
-use crate::geom::{Pattern, Selection, Shape};
+use crate::horizon_chunky_core::geom::{Pattern, Selection, Shape};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Saved {

@@ -13,12 +13,15 @@
 //! - Config: `config/chunky/config.toml` and the saved tasks are read at server start, the trim is applied before
 //!   any world opens, and the tasks are saved at server stop, as in the Horizon port. No `register_configs`, so no
 //!   default file is written.
+
+pub mod horizon_chunky_core;
 use horizon_chunky_core as chunky;
-use horizon_chunky_core::engine::{Who, canon_world, set_level_name};
+use crate::horizon_chunky_core::engine::{Who, canon_world, set_level_name};
 use mod_api::text::TextStyle;
 use mod_api::{
     ChunkRef, Command, CommandArgumentValue, CommandSource, Flow, Hooks, HostSide, LevelRef,
     LevelTickPostEvent, LevelTickPreEvent, PlayerCommandEvent, RegisterCommandsEvent, Registrar,
+    NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
     RegistrationContext, RunModCommandEvent, PlayerCommandsSentEvent, ServerAboutToStartEvent, ServerHost, ServerStoppingEvent,
     Text, TicketController, TicketOwner,
 };
@@ -187,6 +190,11 @@ fn permission_node(sub: &str) -> Option<String> {
         .then(|| format!("chunky.command.{sub}"))
 }
 
+/// A typed Boolean node by name; every name used here is declared in `permission_gather_nodes`.
+fn typed(name: &str) -> PermissionNode {
+    PermissionNode::new(name, PermissionValueType::Boolean)
+}
+
 /// Holds (`forced`) or releases one chunk of `level` through the mod's controller.
 fn force(
     host: &mut dyn ServerHost,
@@ -208,6 +216,15 @@ impl Hooks for Mod {
             .set(r.register_ticket_controller("tasks", false));
     }
 
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        // The root node and one per subcommand, each defaulting to operator level 2 (`LEVEL`).
+        let level = PermissionLevel::from_level(i32::from(LEVEL));
+        let names = std::iter::once(ROOT_NODE.to_string()).chain(SUBS.iter().map(|s| format!("chunky.command.{s}")));
+        for name in names {
+            let _ = event.nodes.add(typed(&name), NodeDefault::Level(level));
+        }
+    }
+
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
         // Each subcommand path carries Chunky's node (`chunky.command.start`), as Brigadier's requires on that
         // literal: a permissions mod can hand one subcommand to a non-operator; level 2 decides when none answers.
@@ -219,7 +236,7 @@ impl Hooks for Mod {
             for label in ["chunky", "cy"] {
                 let command = Command::op(&usage.replacen("chunky", label, 1), 2);
                 event.commands.push(match &node {
-                    Some(node) => command.with_node(node),
+                    Some(node) => command.with_node(&typed(node)),
                     None => command,
                 });
             }
@@ -229,12 +246,16 @@ impl Hooks for Mod {
     /// Tab completion: a player with no chunky node at all (and below the operator level) is not offered
     /// `chunky` or `cy` (Bukkit hides a command the sender may not run).
     fn player_commands_sent(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandsSentEvent<'_>) {
-        let h: &dyn ServerHost = &*host;
-        let may = h.player(event.player).is_some_and(|p| {
-            p.permission_level(h).unwrap_or(0) >= LEVEL
-                || p.permission_value(h, ROOT_NODE) == Some(true)
-                || SUBS.iter().any(|s| p.permission_value(h, &format!("chunky.command.{s}")) == Some(true))
-        });
+        let may = match host.player(event.player) {
+            Some(p) => {
+                p.permission_level(&*host).unwrap_or(0) >= LEVEL
+                    || p.permission_bool(host, &typed(ROOT_NODE)).unwrap_or(false)
+                    || SUBS.iter().any(|s| {
+                        p.permission_bool(host, &typed(&format!("chunky.command.{s}"))).unwrap_or(false)
+                    })
+            }
+            None => false,
+        };
         if !may {
             event.names.retain(|n| !matches!(n.to_ascii_lowercase().as_str(), "chunky" | "cy"));
         }
@@ -253,11 +274,11 @@ impl Hooks for Mod {
             .next()
             .and_then(permission_node)
             .unwrap_or_else(|| ROOT_NODE.to_string());
-        let h: &dyn ServerHost = &*host;
-        let allowed = h.player(event.player).is_some_and(|p| {
-            let level = p.permission_level(h).unwrap_or(0);
-            p.permission_value(h, &node).unwrap_or(level >= LEVEL)
-        });
+        // Any refused query is a denial; the node's default (operator level 2) is what an operator gets.
+        let allowed = match host.player(event.player) {
+            Some(p) => p.permission_bool(host, &typed(&node)).unwrap_or(false),
+            None => false,
+        };
         if allowed {
             return Flow::Continue;
         }
