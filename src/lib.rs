@@ -16,10 +16,11 @@
 
 pub mod horizon_chunky_core;
 use horizon_chunky_core as chunky;
-use crate::horizon_chunky_core::engine::{Who, canon_world, set_level_name};
+use crate::horizon_chunky_core::engine::{Who, canon_world, dimension_of, display_world, set_level_name};
 use mod_api::text::TextStyle;
 use mod_api::{
-    ChunkRef, Command, CommandArgumentValue, CommandSource, Flow, Hooks, HostSide, LevelRef,
+    ChunkRef, Command, CommandArgumentError, CommandArgumentKind, CommandArgumentType,
+    CommandArgumentValue, CommandSender, CommandSource, CommandSuggestion, Flow, Hooks, HostSide, LevelRef,
     LevelTickPostEvent, LevelTickPreEvent, PlayerCommandEvent, RegisterCommandsEvent, Registrar,
     NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
     RegistrationContext, RunModCommandEvent, PlayerCommandsSentEvent, ServerAboutToStartEvent, ServerHost, ServerStoppingEvent,
@@ -65,6 +66,16 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Tells the online player called `name` one line, as Chunky tells a task's owner.
+fn tell_named(host: &mut dyn ServerHost, name: &str, line: &str) {
+    let players = host.players().server_players();
+    for player in players {
+        if player.name(&*host).is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+            let _ = player.tell(host, Text::literal(line.to_owned()));
+        }
+    }
+}
+
 /// `level-name` from server.properties, `world` when it is not there.
 fn level_name(properties: &str) -> String {
     properties
@@ -75,20 +86,21 @@ fn level_name(properties: &str) -> String {
         .unwrap_or_else(|| "world".into())
 }
 
+const SHAPES: [&str; 9] = [
+    "square",
+    "circle",
+    "rectangle",
+    "ellipse",
+    "diamond",
+    "triangle",
+    "pentagon",
+    "hexagon",
+    "star",
+];
+
 /// Chunky's command tree (`BrigadierCommand.build` in Chunky's common module), one usage per line. Each
 /// subcommand usage carries its node (`permission_node`, `register_commands`).
 fn usages() -> Vec<String> {
-    const SHAPES: [&str; 9] = [
-        "square",
-        "circle",
-        "rectangle",
-        "ellipse",
-        "diamond",
-        "triangle",
-        "pentagon",
-        "hexagon",
-        "star",
-    ];
     const PATTERNS: [&str; 7] = [
         "concentric",
         "loop",
@@ -103,18 +115,18 @@ fn usages() -> Vec<String> {
         "chunky help",
         "chunky help [page:integer]",
         "chunky start",
-        "chunky start <world:word>",
+        "chunky start <world:chunky:world>",
         "chunky pause",
-        "chunky pause <world:word>",
+        "chunky pause <world:chunky:world>",
         "chunky continue",
-        "chunky continue <world:word>",
+        "chunky continue <world:chunky:world>",
         "chunky cancel",
-        "chunky cancel <world:word>",
+        "chunky cancel <world:chunky:world>",
         "chunky progress",
         "chunky world",
-        "chunky world <world:word>",
+        "chunky world <world:chunky:world>",
         "chunky worldborder",
-        "chunky worldborder <world:word>",
+        "chunky worldborder <world:chunky:world>",
         "chunky center",
         "chunky center <x:word> <z:word>",
         "chunky spawn",
@@ -132,8 +144,9 @@ fn usages() -> Vec<String> {
         "chunky reload tasks",
         "chunky trim",
         "chunky trim abort",
-        "chunky trim <world:word>",
+        "chunky trim <world:chunky:world>",
         "chunky confirm",
+        "chunky pattern csv",
         "chunky pattern csv <name:word>",
     ]
     .into_iter()
@@ -147,12 +160,12 @@ fn usages() -> Vec<String> {
     }
     // Shape and side are arguments here (see the module doc); the engine checks the words.
     usages.push(
-        "chunky start <world:word> <shape:word> [x:word] [z:word] [rx:word] [rz:word]".into(),
+        "chunky start <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]".into(),
     );
     usages
-        .push("chunky trim <world:word> <shape:word> [x:word] [z:word] [rx:word] [rz:word]".into());
+        .push("chunky trim <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]".into());
     usages.push(
-        "chunky trim <world:word> <shape:word> <x:word> <z:word> <rx:word> <rz:word> <side:word> [filters:text]".into(),
+        "chunky trim <world:chunky:world> <shape:chunky:shape> <x:word> <z:word> <rx:word> <rz:word> <side:chunky:side> [filters:text]".into(),
     );
     usages
 }
@@ -195,6 +208,53 @@ fn typed(name: &str) -> PermissionNode {
     PermissionNode::new(name, PermissionValueType::Boolean)
 }
 
+/// A word argument that accepts anything (the engine answers a wrong world or shape with Chunky's own line) and
+/// completes from a list, as Chunky's `WorldSuggestions` and shape/pattern suggestions do.
+struct Words(fn() -> Vec<String>);
+
+impl CommandArgumentType for Words {
+    fn kind(&self) -> CommandArgumentKind {
+        CommandArgumentKind::Word
+    }
+
+    fn parse(&self, input: &str) -> Result<String, CommandArgumentError> {
+        Ok(input.to_owned())
+    }
+
+    fn suggest(&self, _: Option<&CommandSender>, prefix: &str) -> Vec<CommandSuggestion> {
+        let prefix = prefix.to_ascii_lowercase();
+        (self.0)()
+            .into_iter()
+            .filter(|w| w.to_ascii_lowercase().starts_with(&prefix))
+            .map(CommandSuggestion::new)
+            .collect()
+    }
+}
+
+fn world_words() -> Vec<String> {
+    ["world", "world_nether", "world_the_end"].iter().map(|w| display_world(w)).collect()
+}
+
+fn shape_words() -> Vec<String> {
+    SHAPES.iter().map(|s| (*s).to_owned()).collect()
+}
+
+fn side_words() -> Vec<String> {
+    vec!["outside".to_owned(), "inside".to_owned()]
+}
+
+/// `max-world-size` from server.properties, Minecraft's default when it is not there.
+fn max_world_size() -> f64 {
+    std::fs::read_to_string("server.properties")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("max-world-size="))
+                .and_then(|v| v.trim().parse::<f64>().ok())
+        })
+        .unwrap_or(29_999_984.0)
+}
+
 /// Holds (`forced`) or releases one chunk of `level` through the mod's controller.
 fn force(
     host: &mut dyn ServerHost,
@@ -214,6 +274,9 @@ impl Hooks for Mod {
         let _ = self
             .controller
             .set(r.register_ticket_controller("tasks", false));
+        r.register_command_argument("world", Words(world_words));
+        r.register_command_argument("shape", Words(shape_words));
+        r.register_command_argument("side", Words(side_words));
     }
 
     fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
@@ -307,11 +370,16 @@ impl Hooks for Mod {
                     .filter_map(|a| match &a.value {
                         CommandArgumentValue::String(s) => Some(s.clone()),
                         CommandArgumentValue::Integer(i) => Some(i.to_string()),
+                        CommandArgumentValue::Custom { value, .. } => Some(value.clone()),
                         _ => None,
                     }),
             )
             .collect::<Vec<_>>()
             .join(" ");
+        let sender = match &event.source {
+            CommandSource::Player { player, .. } => player.name(&*host).unwrap_or_default(),
+            _ => String::new(),
+        };
         let at = match &event.source {
             CommandSource::Player { player, .. } => {
                 let entity = player.entity();
@@ -328,16 +396,25 @@ impl Hooks for Mod {
             }
             _ => None,
         };
+        // `chunky spawn` centres on the selected world's own spawn.
+        let selected = chunky::with(|e| e.selected_world().to_owned());
         let spawn = host
-            .level("minecraft:overworld")
+            .level(dimension_of(&selected))
             .and_then(|l| l.respawn_data(&*host))
             .map(|r| [f64::from(r.pos[0]), f64::from(r.pos[2])]);
-        let who = Who { at, spawn };
+        let who = Who { at, spawn, sender };
         let world_dir = lock(&self.world_dir).clone();
-        let lines = chunky::with(|e| {
+        let mut lines = chunky::with(|e| {
             e.set_world_dir(world_dir);
             e.command(&line, &who, chunky::now_ms())
         });
+        // `chunky worldborder` answers the sender with what it read (Chunky's `WorldBorderCommand`).
+        if let Some(world) = chunky::with(|e| e.take_border_world()) {
+            lines.extend(self.border_lines(host, &world));
+        }
+        for l in chunky::with(|e| e.take_console()) {
+            log(&l);
+        }
         for l in lines {
             let _ = host.commands().feedback(Text::literal(l));
         }
@@ -376,9 +453,6 @@ impl Hooks for Mod {
         let level = event.level;
         let dim = level.dimension_id();
         self.sweep_once(host, level, dim, controller);
-        if chunky::with(|e| e.take_border_request(dim)) {
-            self.border(&*host, level, dim);
-        }
         if !chunky::with(|e| e.any_running_in(dim)) {
             // Nothing runs here: the engine forgets the chunks it was told of, so the next run starts from the truth.
             if let Some(prev) = lock(&self.seen).remove(dim) {
@@ -401,6 +475,12 @@ impl Hooks for Mod {
         }
         for l in &actions.log {
             log(l);
+        }
+        for (owner, line) in &actions.notify {
+            tell_named(host, owner, line);
+        }
+        for l in chunky::with(|e| e.take_console()) {
+            log(&l);
         }
     }
 
@@ -465,14 +545,18 @@ impl Mod {
         seen.insert(dim.to_owned(), now);
     }
 
-    /// The border's centre and size go to the engine's selection (`chunky worldborder`), as the Horizon port did.
-    fn border(&self, host: &dyn ServerHost, level: LevelRef, dim: &str) {
-        let Some([x0, z0, x1, z1]) = level.world_border(host) else {
-            log(&format!("no world border to read in {dim}"));
-            return;
+    /// The selected world's border becomes the selection's centre and radius; the answer is Chunky's lines.
+    fn border_lines(&self, host: &mut dyn ServerHost, world: &str) -> Vec<String> {
+        let border = host
+            .level(dimension_of(world))
+            .and_then(|level| level.world_border(&*host));
+        let Some([x0, z0, x1, z1]) = border else {
+            return vec![format!(
+                "[Chunky] No world border to read in {}.",
+                display_world(world)
+            )];
         };
         let centre = [(x0 + x1) / 2.0, (z0 + z1) / 2.0];
-        let line = chunky::with(|e| e.set_border(centre, x1 - x0));
-        log(&line);
+        chunky::with(|e| e.set_border(centre, x1 - x0, max_world_size()))
     }
 }

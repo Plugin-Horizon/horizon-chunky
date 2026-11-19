@@ -9,14 +9,19 @@ pub struct Saved {
     pub sel: Selection,
     pub chunks: u64,
     pub time_ms: u64,
+    /// `rate-limit`: chunks per second at most, 0 for none.
+    pub rate_limit: u64,
+    /// `owner`: the player told when the task finishes.
+    pub owner: Option<String>,
 }
 
 /// The file's keys are the ones Chunky's wiki documents. The z radius of a rectangle or ellipse is not documented
 /// there: this mod writes it as `radius-z`, only for those two shapes, and a file without it uses `radius` for both.
 pub fn render(s: &Saved) -> String {
     let z = if s.sel.shape.two_radii() { format!("radius-z={:?}\n", s.sel.radius_z) } else { String::new() };
+    let owner = s.owner.as_ref().map(|o| format!("owner={o}\n")).unwrap_or_default();
     format!(
-        "world={}\ncancelled={}\ncenter-x={:?}\ncenter-z={:?}\nradius={:?}\n{z}shape={}\npattern={}\nchunks={}\ntime={}\n",
+        "world={}\ncancelled={}\ncenter-x={:?}\ncenter-z={:?}\nradius={:?}\n{z}shape={}\npattern={}\nrate-limit={}\n{owner}chunks={}\ntime={}\n",
         s.world,
         s.cancelled,
         s.sel.cx,
@@ -24,6 +29,7 @@ pub fn render(s: &Saved) -> String {
         s.sel.radius,
         s.sel.shape.name(),
         pattern_text(&s.sel.pattern),
+        s.rate_limit,
         s.chunks,
         s.time_ms
     )
@@ -82,6 +88,8 @@ pub fn parse(text: &str) -> Result<Saved, String> {
         },
         chunks: get("chunks")?.parse().map_err(|_| "bad chunks")?,
         time_ms: get("time")?.parse().map_err(|_| "bad time")?,
+        rate_limit: m.get("rate-limit").and_then(|v| v.parse().ok()).unwrap_or(0),
+        owner: m.get("owner").filter(|o| !o.is_empty()).cloned(),
     })
 }
 
@@ -97,6 +105,8 @@ mod tests {
             sel: Selection { shape: Shape::Circle, pattern: Pattern::Region, cx: -32.5, cz: 0.0, radius: 5000.0, radius_z: 5000.0 },
             chunks: 1234,
             time_ms: 99,
+            rate_limit: 25,
+            owner: Some("Steve".into()),
         };
         assert_eq!(parse(&render(&s)), Ok(s));
     }
@@ -110,6 +120,8 @@ mod tests {
                 sel: Selection { shape, pattern, cx: 1.0, cz: 2.0, radius: 300.0, radius_z: if shape.two_radii() { 700.0 } else { 300.0 } },
                 chunks: 5,
                 time_ms: 6,
+                rate_limit: 0,
+                owner: None,
             };
             let text = render(&s);
             assert_eq!(text.contains("radius-z="), shape.two_radii(), "{text}");

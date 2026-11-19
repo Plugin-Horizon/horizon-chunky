@@ -9,3 +9,11 @@ Round 1
 - Unsure:
   - `player_command` no longer falls back to the operator level when the query fails; the declared default (level 2) gives operators the same answer. The spec's "any error is a denial" was applied.
   - `SUBS` names are assumed to pass the node name rules (lowercase letters only).
+
+Audit fixes
+- Fixed: `chunky worldborder` answers the sender at once with Chunky's centre/radius lines and the max-world-size notice (read in `run_mod_command`, no log-only result).
+- Fixed: a task's owner (the player who started or continued it) is told the completion line; the console gets `Task stopped for X.` on pause and cancel; `confirm` actions are kept per sender.
+- Fixed: `chunky limit <rate>` (rate limiter, saved as `rate-limit` with `owner` in the task file), `limit` row in the help menu, bare `chunky pattern csv` prints the pattern help, `GAPS.md` references now point to the README.
+- Fixed: tab completion for world, shape and trim-side arguments through registered argument types `chunky:world`, `chunky:shape`, `chunky:side` (they accept any word; the engine keeps Chunky's own "not found" lines); `chunky spawn` uses the selected world's spawn.
+- Gaps: see the README's Known gaps (colours, radius/disk checks on start, `debug map`, trim filter `unmodified`, live trim).
+- Unsure: the argument kind ids in usages (`<world:chunky:world>`) and `CommandArgumentValue::Custom { value, .. }` are written from the docs, not compiled.

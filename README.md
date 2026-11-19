@@ -18,7 +18,7 @@ This is a native trait mod: `horizon-mod.toml`, a `Cargo.toml` that depends on `
 
 ## Commands
 
-Chunky's syntax, with the `chunky` root (`/chunky` in the plugin; the `cy` alias is not registered on Horizon). A
+Chunky's syntax, with the `chunky` root (`/chunky` in the plugin, and the `cy` alias). A
 player needs `chunky.command.<sub>` from a permissions mod, else operator level 2; the console runs everything.
 
 ```
@@ -36,7 +36,9 @@ chunky trim abort           chunky confirm                 chunky help [page]
 one or two; the side word of `trim` comes after both radii. `cancel`, `start` over a saved task and `trim` ask for
 `chunky confirm` within 60 seconds.
 
-Not ported: `limit`, `debug map`, the `border` subcommands (ChunkyBorder is not on Horizon), the trim filter
+`limit <rate>` caps a task at that many chunks per second (0 for none; saved with the task). A player who starts or continues a task is told when it finishes, and `confirm` is kept per sender. Tab completion offers world, shape, pattern and trim-side words.
+
+Not ported: `debug map`, the `border` subcommands (ChunkyBorder is not on Horizon), the trim filter
 `unmodified` and inhabited ranges. See the Known gaps section.
 
 ## Shapes and patterns
@@ -87,4 +89,7 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
-- `chunky.command.<sub>` permission nodes are not checked: every sub-command needs operator level 2, so a permissions mod cannot grant a single sub-command.
+- Messages are plain text: Chunky's colour codes (help, trim warning, notices) are left out.
+- `start` has no radius-limit check and no disk-space warning; `chunky debug map`, the `border` subcommands, the trim filter `unmodified` and inhabited ranges are not ported; trim runs at the next server start, not live.
+- Only the Overworld, Nether and End are known worlds; a custom dimension cannot be pre-generated.
+- A player without a node gets Bukkit's permission line (the original hides the command on Paper's Brigadier build).
