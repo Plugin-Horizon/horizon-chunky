@@ -1292,7 +1292,7 @@ impl Engine {
             inside,
             inhabited,
             inhabited_min: filters.inhabited.map_or(0, |(min, _)| min),
-            unmodified: filters.unmodified.map(|u| u.cutoff),
+            unmodified: filters.unmodified.as_ref().map(|u| u.cutoff),
         };
         let p = job.preview();
         let side = if inside { "inside" } else { "outside" };
@@ -1884,7 +1884,8 @@ mod tests {
         e.command("chunky spawn", &w, 0);
         assert_eq!((e.selection.cx, e.selection.cz), (120.0, -48.0));
         e.command("chunky world world_nether", &w, 0);
-        e.command("chunky spawn", &w, 0);
+        // The glue passes the selected world's spawn (`Who::spawn`): the overworld's is not the nether's.
+        e.command("chunky spawn", &Who::default(), 0);
         assert_eq!((e.selection.cx, e.selection.cz), (0.0, 0.0));
         e.command("chunky corners 0 0 15 31", &w, 0);
         let s = &e.selection;
@@ -2123,7 +2124,7 @@ mod tests {
         assert_eq!(held, 20);
         assert_eq!(e.command("chunky limit 0", &console, 0), vec!["[Chunky] Rate limit disabled for world."]);
         assert_eq!(e.tick("minecraft:overworld", 1100).hold.len(), e.cfg.max_in_flight - 20);
-        assert_eq!(e.command("chunky limit x", &console, 0), vec!["chunky limit <rate> - Set the max chunks per second"]);
+        assert_eq!(e.command("chunky limit x", &console, 0), vec!["&2chunky limit <rate>&r - Set the max chunks per second"]);
     }
 
     #[test]

@@ -23,7 +23,7 @@ use mod_api::text::TextStyle;
 use mod_api::{
     ChunkRef, Command, CommandArgumentError, CommandArgumentKind, CommandArgumentType,
     CommandArgumentValue, CommandSender, CommandSource, CommandSuggestion, Flow, Hooks, HostSide, LevelRef,
-    LevelTickPostEvent, LevelTickPreEvent, PlayerCommandEvent, RegisterCommandsEvent, Registrar,
+    LevelTickPostEvent, LevelTickPreEvent, PlayerCommandEvent, RegisterCommandsEvent, RegisterNodeCommandsEvent, Registrar,
     NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
     RegistrationContext, RunModCommandEvent, PlayerCommandsSentEvent, ServerAboutToStartEvent, ServerHost, ServerStoppingEvent,
     Text, TicketController, TicketOwner,
@@ -436,19 +436,29 @@ impl Hooks for Mod {
     }
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+        for usage in usages() {
+            let sub = usage.split(' ').nth(1).filter(|w| !w.starts_with('<') && !w.starts_with('['));
+            if sub.and_then(permission_node).is_some() {
+                continue;
+            }
+            for label in ["chunky", "cy"] {
+                event.commands.push(Command::op(&usage.replacen("chunky", label, 1), 2));
+            }
+        }
+    }
+
+    fn register_node_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterNodeCommandsEvent<'_>) {
         // Each subcommand path carries Chunky's node (`chunky.command.start`), as Brigadier's requires on that
         // literal: a permissions mod can hand one subcommand to a non-operator; level 2 decides when none answers.
         // The bare `/chunky` (help) has no node, so it does not gate the subcommands.
         for usage in usages() {
             let sub = usage.split(' ').nth(1).filter(|w| !w.starts_with('<') && !w.starts_with('['));
-            let node = sub.and_then(permission_node);
+            let Some(node) = sub.and_then(permission_node) else {
+                continue;
+            };
             // plugin.yml gives Chunky the alias `cy`: the same usages under that label.
             for label in ["chunky", "cy"] {
-                let command = Command::op(&usage.replacen("chunky", label, 1), 2);
-                event.commands.push(match &node {
-                    Some(node) => command.with_node(&typed(node)),
-                    None => command,
-                });
+                event.commands.push(Command::op(&usage.replacen("chunky", label, 1), 2).with_node(&typed(&node)));
             }
         }
     }
