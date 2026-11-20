@@ -1,13 +1,15 @@
 //! Tasks, commands and the per-tick work, without any game types so it can be tested.
 
-use crate::geom::{self, Chunk, ChunkList, Pattern, Selection, Shape};
-use crate::region::{self, ExistingIndex};
-use crate::task::{self, Saved};
-use crate::trim::{self, TrimJob};
+use crate::horizon_chunky_core::genmap;
+use crate::horizon_chunky_core::lang::tr;
+use crate::horizon_chunky_core::geom::{self, Chunk, ChunkList, Pattern, Selection, Shape};
+use crate::horizon_chunky_core::region::{self, ExistingIndex};
+use crate::horizon_chunky_core::task::{self, Saved};
+use crate::horizon_chunky_core::trim::{self, TrimJob};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::iter::Peekable;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Chunks skipped as already generated per task and tick, at most.
 const MAX_SKIPS_PER_TICK: usize = 4096;
@@ -31,6 +33,8 @@ pub struct Config {
     pub chunk_timeout_ticks: u64,
     /// Load chunks the save already has fully generated, instead of skipping them.
     pub force_load_existing_chunks: bool,
+    /// The language of the messages (`lang/<code>.json`), `en` for the engine's own text.
+    pub language: String,
 }
 
 impl Default for Config {
@@ -45,6 +49,7 @@ impl Default for Config {
             tick_budget_ms: 50,
             chunk_timeout_ticks: 400,
             force_load_existing_chunks: false,
+            language: "en".into(),
         }
     }
 }
@@ -65,6 +70,7 @@ impl Config {
                 "tick-budget-ms" => c.tick_budget_ms = v.parse().unwrap_or(c.tick_budget_ms),
                 "chunk-timeout-ticks" => c.chunk_timeout_ticks = v.parse().unwrap_or(c.chunk_timeout_ticks),
                 "force-load-existing-chunks" => c.force_load_existing_chunks = v == "true",
+                "language" => c.language = v.to_owned(),
                 _ => {}
             }
         }
@@ -78,6 +84,8 @@ pub struct Actions {
     pub hold: Vec<Chunk>,
     pub release: Vec<Chunk>,
     pub log: Vec<String>,
+    /// Lines for a task's owner (a player's name), as Chunky's `setOwner` sends the completion line to them too.
+    pub notify: Vec<(String, String)>,
 }
 
 /// Who typed a command, and what the glue read from the game for it.
@@ -87,6 +95,8 @@ pub struct Who {
     pub at: Option<([f64; 2], String)>,
     /// The world spawn's block x and z (level.dat), for `chunky spawn`.
     pub spawn: Option<[f64; 2]>,
+    /// The sender's name, empty for the console: a pending action and a task's owner are kept per sender.
+    pub sender: String,
 }
 
 /// One entry of a task's window, in sequence order.
@@ -135,6 +145,12 @@ struct Task {
     last_save_ms: u64,
     session_start: (u64, u64),
     current: Chunk,
+    /// The player who started or continued it (told when it finishes), as Chunky's `setOwner`.
+    owner: Option<String>,
+    /// Chunks per second at most, 0 for no limit (`chunky limit`).
+    rate_limit: u64,
+    /// Chunks the limit lets through right now, refilled each tick.
+    credit: f64,
 }
 
 impl Task {
@@ -162,6 +178,9 @@ impl Task {
             last_save_ms: 0,
             session_start: (done, elapsed_ms),
             current: (0, 0),
+            owner: None,
+            rate_limit: 0,
+            credit: 0.0,
         }
     }
 
@@ -222,12 +241,68 @@ fn level_name() -> String {
     }
 }
 
-/// The Bukkit name of a canonical world (`world` -> the level name, `world_nether` -> `<level>_nether`).
+/// Dimensions of the server other than the three Chunky knows by name, by dimension id (`ns:path`), in the order
+/// they were seen. A world name is `&'static str`, so each id is leaked once.
+static CUSTOM: RwLock<Vec<&'static str>> = RwLock::new(Vec::new());
+
+/// Remembers a loaded dimension as a world Chunky can name (the vanilla three need no entry).
+pub fn register_dimension(id: &str) {
+    if !id.contains(':') || matches!(id, "minecraft:overworld" | "minecraft:the_nether" | "minecraft:the_end") {
+        return;
+    }
+    if custom_dimension(id).is_some() {
+        return;
+    }
+    let leaked: &'static str = Box::leak(id.to_owned().into_boxed_str());
+    CUSTOM.write().unwrap_or_else(|e| e.into_inner()).push(leaked);
+}
+
+/// The trim filter completions after the words `prefix` (the filters typed so far, the last one maybe partly):
+/// each filter key not used yet with its `=`, and the byte where its replacement starts. Nothing once the word being
+/// typed has its `=` (`TrimFilters.suggestions`). A bare first word counts as `inhabited`.
+pub fn trim_filter_suggestions(prefix: &str) -> Vec<(String, usize)> {
+    let (done, word, start) = match prefix.rfind(' ') {
+        Some(at) => (&prefix[..at], &prefix[at + 1..], at + 1),
+        None => ("", prefix, 0),
+    };
+    if word.contains('=') {
+        return Vec::new();
+    }
+    let used: Vec<String> = done
+        .split_whitespace()
+        .map(|token| match token.split_once('=') {
+            Some((key, _)) => key.to_ascii_lowercase(),
+            None => "inhabited".to_owned(),
+        })
+        .collect();
+    let word = word.to_ascii_lowercase();
+    ["inhabited", "unmodified"]
+        .into_iter()
+        .filter(|key| !used.iter().any(|u| u.as_str() == *key) && key.starts_with(word.as_str()))
+        .map(|key| (format!("{key}="), start))
+        .collect()
+}
+
+/// The dimension id of a remembered custom dimension, matched without regard to case.
+fn custom_dimension(name: &str) -> Option<&'static str> {
+    CUSTOM.read().unwrap_or_else(|e| e.into_inner()).iter().copied().find(|c| c.eq_ignore_ascii_case(name))
+}
+
+/// The worlds Chunky lists: the three by their Bukkit names, then the custom dimensions.
+pub fn available_worlds() -> Vec<String> {
+    let mut out = vec![display_world("world"), display_world("world_nether"), display_world("world_the_end")];
+    out.extend(CUSTOM.read().unwrap_or_else(|e| e.into_inner()).iter().map(|c| (*c).to_owned()));
+    out
+}
+
+/// The Bukkit name of a canonical world (`world` -> the level name, `world_nether` -> `<level>_nether`); a custom
+/// dimension is named by its id.
 pub fn display_world(canon: &str) -> String {
     let level = level_name();
     match canon {
         "world_nether" => format!("{level}_nether"),
         "world_the_end" => format!("{level}_the_end"),
+        c if c.contains(':') => c.to_owned(),
         _ => level,
     }
 }
@@ -249,7 +324,7 @@ pub fn canon_world(name: &str) -> Option<&'static str> {
         "world" | "overworld" | "minecraft:overworld" => Some("world"),
         "world_nether" | "the_nether" | "nether" | "minecraft:the_nether" => Some("world_nether"),
         "world_the_end" | "the_end" | "end" | "minecraft:the_end" => Some("world_the_end"),
-        _ => None,
+        _ => custom_dimension(name),
     }
 }
 
@@ -257,7 +332,7 @@ pub fn dimension_of(world: &str) -> &'static str {
     match world {
         "world_nether" => "minecraft:the_nether",
         "world_the_end" => "minecraft:the_end",
-        _ => "minecraft:overworld",
+        _ => custom_dimension(world).unwrap_or("minecraft:overworld"),
     }
 }
 
@@ -269,8 +344,14 @@ pub struct Engine {
     dir: Option<PathBuf>,
     /// The open world's folder, from the glue.
     world_dir: Option<PathBuf>,
-    /// An action waiting for `chunky confirm`, until the time given (Chunky's pending action, one per server here).
-    pending: Option<(Pending, u64)>,
+    /// An action waiting for `chunky confirm`, until the time given, one per sender name as Chunky keeps them.
+    pending: HashMap<String, (Pending, u64)>,
+    /// The sender of the command being run (empty for the console).
+    sender: String,
+    /// Lines for the console only (`Task stopped for ...`), taken by the glue after a command.
+    console: Vec<String>,
+    /// The rate limit `chunky limit` set for the selection; a new task starts with it.
+    selected_rate: u64,
     tasks: BTreeMap<String, Task>,
     selection: Selection,
     selected_world: String,
@@ -280,6 +361,8 @@ pub struct Engine {
     last_level_ms: u64,
     /// Chunks that are in the world now, by dimension: a chunk loaded as a neighbour of an earlier one is done on arrival.
     loaded: HashMap<String, HashSet<Chunk>>,
+    /// Lines a background job (`debug map`) finished with, by the sender who asked (empty: console), taken by the glue.
+    async_lines: Arc<Mutex<Vec<(String, String)>>>,
 }
 
 impl Engine {
@@ -289,7 +372,10 @@ impl Engine {
             base: None,
             dir,
             world_dir: None,
-            pending: None,
+            pending: HashMap::new(),
+            sender: String::new(),
+            console: Vec::new(),
+            selected_rate: 0,
             tasks: BTreeMap::new(),
             selection: Selection {
                 shape: Shape::Square,
@@ -304,7 +390,13 @@ impl Engine {
             border_request: None,
             last_level_ms: 0,
             loaded: HashMap::new(),
+            async_lines: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// The lines background jobs finished with since the last call: (sender, line), an empty sender being the console.
+    pub fn take_async(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut *self.async_lines.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     pub fn set_dir(&mut self, dir: PathBuf) {
@@ -322,6 +414,11 @@ impl Engine {
         if dir.is_some() {
             self.world_dir = dir;
         }
+    }
+
+    /// The world the selection is in (`world`, `world_nether` or `world_the_end`).
+    pub fn selected_world(&self) -> &str {
+        &self.selected_world
     }
 
     pub fn has_world_dir(&self) -> bool {
@@ -375,6 +472,9 @@ impl Engine {
             let Ok(text) = std::fs::read_to_string(&p) else { continue };
             match task::parse(&text) {
                 Ok(s) if !s.cancelled => {
+                    if s.world.contains(':') {
+                        register_dimension(&s.world);
+                    }
                     let Some(w) = canon_world(&s.world) else {
                         log.push(format!("[Chunky] Skipping saved task for unknown world {}", s.world));
                         continue;
@@ -383,16 +483,20 @@ impl Engine {
                     let list = match self.list_for(w, &s.sel, false) {
                         Ok(l) => l,
                         Err(e) => {
-                            log.push(format!("[Chunky] Skipping saved task for {w}: {e}"));
+                            log.push(format!("[Chunky] Skipping saved task for {}: {e}", display_world(w)));
                             continue;
                         }
                     };
                     log.push(format!(
-                        "[Chunky] Loaded saved task for {w}: {} chunks done, {}",
+                        "[Chunky] Loaded saved task for {}: {} chunks done, {}",
+                        display_world(w),
                         s.chunks,
                         if run == Run::Running { "continuing" } else { "paused" }
                     ));
-                    self.tasks.insert(w.to_owned(), Task::new(s.sel, list, s.chunks, s.time_ms, run));
+                    let mut t = Task::new(s.sel, list, s.chunks, s.time_ms, run);
+                    t.rate_limit = s.rate_limit;
+                    t.owner = s.owner;
+                    self.tasks.insert(w.to_owned(), t);
                 }
                 Ok(_) => {}
                 Err(e) => log.push(format!("[Chunky] Skipping {}: {e}", p.display())),
@@ -405,7 +509,15 @@ impl Engine {
         let Some(dir) = &self.dir else { return };
         let _ = std::fs::create_dir_all(dir);
         let saved =
-            Saved { world: world.to_owned(), cancelled, sel: t.sel.clone(), chunks: t.done, time_ms: t.elapsed_ms };
+            Saved {
+                world: world.to_owned(),
+                cancelled,
+                sel: t.sel.clone(),
+                chunks: t.done,
+                time_ms: t.elapsed_ms,
+                rate_limit: t.rate_limit,
+                owner: t.owner.clone(),
+            };
         let path = dir.join(format!("{world}.properties"));
         let tmp = dir.join(format!("{world}.properties.tmp"));
         if std::fs::write(&tmp, task::render(&saved)).is_ok() {
@@ -467,10 +579,13 @@ impl Engine {
                 continue;
             }
             t.ticks += 1;
-            if let Some(last) = t.last_ms {
-                t.elapsed_ms += now_ms.saturating_sub(last).min(1000);
-            }
+            let dt_ms = t.last_ms.map_or(0, |last| now_ms.saturating_sub(last).min(1000));
+            t.elapsed_ms += dt_ms;
             t.last_ms = Some(now_ms);
+            if t.rate_limit > 0 {
+                let limit = t.rate_limit as f64;
+                t.credit = (t.credit + limit * dt_ms as f64 / 1000.0).min(limit);
+            }
             // Tickets go back in order on purpose: releasing a loaded chunk behind a slower one drops neighbours the
             // engine generated for it, and they are generated again later (radius 1000: 260 -> 244 cps, more CPU).
             while let Some(e) = t.inflight.front() {
@@ -480,7 +595,7 @@ impl Engine {
                     break;
                 }
                 if timed_out && !ready {
-                    out.log.push(format!("[Chunky] Gave up waiting for chunk {}, {} in {w}", c.0, c.1));
+                    out.log.push(format!("[Chunky] Gave up waiting for chunk {}, {} in {}", c.0, c.1, display_world(w)));
                 }
                 t.inflight.pop_front();
                 if held {
@@ -499,7 +614,11 @@ impl Engine {
             }
             if !over_budget {
                 let mut skips = 0;
-                while t.held < cfg.max_in_flight && !t.exhausted && t.inflight.len() < MAX_QUEUE {
+                while t.held < cfg.max_in_flight
+                    && !t.exhausted
+                    && t.inflight.len() < MAX_QUEUE
+                    && (t.rate_limit == 0 || t.credit >= 1.0)
+                {
                     let Some(&c) = t.seq.peek() else {
                         t.exhausted = true;
                         break;
@@ -528,17 +647,25 @@ impl Engine {
                         let ready = already.is_some_and(|l| l.contains(&c));
                         t.inflight.push_back(Entry { chunk: c, ready, since: t.ticks, held: true });
                         t.held += 1;
+                        if t.rate_limit > 0 {
+                            t.credit -= 1.0;
+                        }
                         out.hold.push(c);
                     }
                 }
             }
             if t.exhausted && t.inflight.is_empty() {
-                out.log.push(format!(
-                    "[Chunky] Task finished for {w}. Processed: {} chunks ({:.2}%), Total time: {}",
+                let line = format!(
+                    "[Chunky] Task finished for {}. Processed: {} chunks ({:.2}%), Total time: {}",
+                    display_world(w),
                     t.done,
                     t.percent(),
                     hms(t.elapsed_ms / 1000)
-                ));
+                );
+                if let Some(owner) = &t.owner {
+                    out.notify.push((owner.clone(), line.clone()));
+                }
+                out.log.push(line);
                 finished.push(w.clone());
                 continue;
             }
@@ -565,26 +692,36 @@ impl Engine {
         out
     }
 
-    pub fn take_border_request(&mut self, dim: &str) -> bool {
-        if self.border_request.as_deref().is_some_and(|w| dimension_of(w) == dim) {
-            self.border_request = None;
-            return true;
-        }
-        false
+    /// The world whose border `chunky worldborder` asked for, once: the glue reads it and answers the sender.
+    pub fn take_border_world(&mut self) -> Option<String> {
+        self.border_request.take()
     }
 
-    /// The border of the selected world, read by the glue: centre and edge length in blocks.
-    pub fn set_border(&mut self, centre: [f64; 2], size: f64) -> String {
+    /// Lines for the console only, since the last call.
+    pub fn take_console(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.console)
+    }
+
+    /// The border of the selected world, read by the glue: centre and edge length in blocks. The answer is
+    /// Chunky's `WorldBorderCommand` lines; `max_world_size` is `max-world-size` from server.properties.
+    pub fn set_border(&mut self, centre: [f64; 2], size: f64, max_world_size: f64) -> Vec<String> {
         self.selection.cx = centre[0];
         self.selection.cz = centre[1];
         self.selection.radius = (size / 2.0).max(1.0);
         self.selection.radius_z = self.selection.radius;
-        pre(format!(
-            "Center changed to {}, {}. Radius changed to {}.",
+        let mut out = vec![pre(format!(
+            "Center changed to {}, {}.",
             number(self.selection.cx),
-            number(self.selection.cz),
-            number(self.selection.radius)
-        ))
+            number(self.selection.cz)
+        ))];
+        out.push(pre(format!("Radius changed to {}.", number(self.selection.radius))));
+        if self.selection.radius > max_world_size {
+            out.push(pre(format!(
+                "&eNotice: Your world border is currently set larger than the maximum of {} configured in server.properties. This is normally an error and can cause issues.",
+                number(max_world_size)
+            )));
+        }
+        out
     }
 
     /// The progress lines for `progress`: running tasks as Chunky's update, paused ones with their count.
@@ -593,7 +730,7 @@ impl Engine {
             .iter()
             .map(|(w, t)| match t.run {
                 Run::Running => progress_line(w, t),
-                Run::Paused => format!("[Chunky] Task paused for {w}. Processed: {} chunks ({:.2}%)", t.done, t.percent()),
+                Run::Paused => format!("[Chunky] Task paused for {}. Processed: {} chunks ({:.2}%)", display_world(w), t.done, t.percent()),
             })
             .collect()
     }
@@ -607,6 +744,7 @@ impl Engine {
         }
         let args: Vec<&str> = it.collect();
         let player = who.at.is_some();
+        self.sender = who.sender.clone();
         let Some((&cmd, rest)) = args.split_first() else { return help(None, player) };
         match cmd.to_ascii_lowercase().as_str() {
             "start" => self.cmd_start(rest, now_ms),
@@ -631,10 +769,10 @@ impl Engine {
             "trim" => self.cmd_trim(rest, now_ms),
             "confirm" => self.cmd_confirm(now_ms),
             "reload" => self.cmd_reload(rest),
-            "limit" => vec![pre("Not ported yet: chunky limit (see GAPS.md).")],
+            "limit" => self.cmd_limit(rest),
             "debug" => match rest.first().map(|s| s.to_ascii_lowercase()).as_deref() {
-                Some("map") => vec![pre("Not ported yet: chunky debug map (see GAPS.md).")],
-                _ => vec![help_line("debug").into()],
+                Some("map") => self.cmd_debug_map(),
+                _ => vec![help_line("debug")],
             },
             "help" => help(rest.first().and_then(|s| s.parse::<i64>().ok()), player),
             _ => help(None, player),
@@ -699,17 +837,69 @@ impl Engine {
         }
         let w = self.selected_world.clone();
         if self.tasks.get(&w).is_some_and(|t| t.run == Run::Running) {
-            return vec![pre(format!("Task already started for {w}!"))];
+            return vec![pre(format!("Task already started for {}!", display_world(&w)))];
+        }
+        if self.selection.radius > self.radius_limit() {
+            return vec![pre(format!(
+                "Your host has limited the maximum pre-generation radius to {} to avoid excessive disk space usage. Reduce the radius or contact your host if you wish to have this limit removed.",
+                number(self.radius_limit())
+            ))];
         }
         let sel = self.selection.clone();
         if self.tasks.contains_key(&w) {
             // A saved task is waiting for this world: starting over needs `confirm`, as Chunky asks.
-            self.pending = Some((Pending::Start(sel, w), now_ms + CONFIRM_MS));
+            self.pending.insert(self.sender.clone(), (Pending::Start(sel, w), now_ms + CONFIRM_MS));
             return vec![pre(
                 "A task was already started for this world. To continue running it, type '/chunky continue'. To start a new task, type '/chunky confirm'.",
             )];
         }
         self.start_task(&w, sel)
+    }
+
+    /// `radius-limit` from `.chunky.properties` in the config folder (a host's cap on `start`), none without it.
+    fn radius_limit(&self) -> f64 {
+        let text = self.base.as_ref().and_then(|b| std::fs::read_to_string(b.join(".chunky.properties")).ok());
+        text.and_then(|t| {
+            t.lines().find_map(|l| {
+                let (k, v) = l.split_once(['=', ':'])?;
+                (k.trim() == "radius-limit").then(|| v.trim().parse::<f64>().ok()).flatten()
+            })
+        })
+        .filter(|v| !v.is_nan())
+        .unwrap_or(f64::MAX)
+    }
+
+    /// `debug map`: a PNG of how far the selection is generated, written on a thread; the answer follows through
+    /// `take_async`.
+    fn cmd_debug_map(&mut self) -> Vec<String> {
+        let w = self.selected_world.clone();
+        let Some(wd) = self.world_dir.clone() else { return vec![pre("The world folder is not known yet.")] };
+        let dir = region::dimension_dir(&wd, &w);
+        let base = self.base.clone().unwrap_or_else(|| PathBuf::from("config/chunky"));
+        let path = base.join("debug").join(format!("{w}.png"));
+        let sel = self.selection.clone();
+        let sender = self.sender.clone();
+        let done = Arc::clone(&self.async_lines);
+        let name = display_world(&w);
+        std::thread::spawn(move || {
+            let result = genmap::scan(&dir, &sel).and_then(|m| m.write(&path).map(|()| m));
+            let line = match result {
+                Ok(m) => {
+                    let missing = format!("{}{}", if m.exact() { "" } else { "~" }, m.counts[genmap::MISSING]);
+                    pre(format!(
+                        "Generation map for {name} saved to {}. Full: {}, Unlit or unsaved: {}, Incomplete: {}, Invalid: {}, Not generated: {missing}",
+                        path.display(),
+                        m.counts[genmap::FULL],
+                        m.counts[genmap::UNFINISHED],
+                        m.counts[genmap::INCOMPLETE],
+                        m.counts[genmap::INVALID],
+                    ))
+                }
+                Err(e) => pre(format!("&cUnable to save generation map for {name} ({e}).")),
+            };
+            done.lock().unwrap_or_else(|e| e.into_inner()).push((sender, line));
+        });
+        vec![pre(format!("Creating generation map for {}...", display_world(&w)))]
     }
 
     /// Starts a task for `w` with the selection `sel`, replacing a paused one.
@@ -718,7 +908,11 @@ impl Engine {
             Ok(l) => l,
             Err(e) => return vec![pre(format!("Cannot start the {} pattern: {e}", sel.pattern.name()))],
         };
-        let t = Task::new(sel.clone(), list, 0, 0, Run::Running);
+        let mut t = Task::new(sel.clone(), list, 0, 0, Run::Running);
+        t.rate_limit = self.selected_rate;
+        if !self.sender.is_empty() {
+            t.owner = Some(self.sender.clone());
+        }
         if let Some(mut old) = self.tasks.remove(w) {
             let held = old.rewind();
             self.release_later.entry(w.to_owned()).or_default().extend(held);
@@ -726,7 +920,8 @@ impl Engine {
         self.save(w, false, &t);
         self.tasks.insert(w.to_owned(), t);
         vec![pre(format!(
-            "Task started in {w} for the {} region centered at {}, {} with radius {}.",
+            "Task started in {} for the {} region centered at {}, {} with radius {}.",
+            display_world(w),
             sel.shape.name(),
             number(sel.cx),
             number(sel.cz),
@@ -754,6 +949,9 @@ impl Engine {
 
     fn pause_one(&mut self, w: &str) -> String {
         if let Some(t) = self.tasks.get_mut(w) {
+            if t.run == Run::Running {
+                self.console.push(pre(format!("Task stopped for {}.", display_world(w))));
+            }
             t.run = Run::Paused;
             let held = t.rewind();
             self.release_later.entry(w.to_owned()).or_default().extend(held);
@@ -761,11 +959,12 @@ impl Engine {
         if let Some(t) = self.tasks.get(w) {
             self.save(w, false, t);
         }
-        pre(format!("Task paused for {w}."))
+        pre(format!("Task paused for {}.", display_world(w)))
     }
 
     /// `continue [world]`: resumes the paused tasks (or the one of `world`).
     fn cmd_continue(&mut self, rest: &[&str]) -> Vec<String> {
+        let sender = self.sender.clone();
         let names: Vec<String> = match rest.first() {
             Some(name) => match canon_world(name) {
                 Some(w) => vec![w.to_owned()],
@@ -777,11 +976,14 @@ impl Engine {
         for w in names {
             match self.tasks.get_mut(&w) {
                 None => {}
-                Some(t) if t.run == Run::Running => out.push(pre(format!("Task already started for {w}!"))),
+                Some(t) if t.run == Run::Running => out.push(pre(format!("Task already started for {}!", display_world(&w)))),
                 Some(t) => {
                     t.run = Run::Running;
+                    if !sender.is_empty() {
+                        t.owner = Some(sender.clone());
+                    }
                     t.session_start = (t.done, t.elapsed_ms);
-                    out.push(pre(format!("Task continuing for {w}.")));
+                    out.push(pre(format!("Task continuing for {}.", display_world(&w))));
                 }
             }
         }
@@ -803,7 +1005,7 @@ impl Engine {
             },
             None => None,
         };
-        self.pending = Some((Pending::Cancel(world), now_ms + CONFIRM_MS));
+        self.pending.insert(self.sender.clone(), (Pending::Cancel(world), now_ms + CONFIRM_MS));
         vec![pre("Cancelled tasks cannot be continued. If you are sure you want to cancel, type '/chunky confirm'.")]
     }
 
@@ -811,7 +1013,7 @@ impl Engine {
         let names: Vec<String> = match world {
             Some(w) => {
                 if !self.tasks.contains_key(w) {
-                    return vec![pre(format!("Task cancelled for {w}."))];
+                    return vec![pre(format!("Task cancelled for {}.", display_world(w)))];
                 }
                 vec![w.to_owned()]
             }
@@ -823,8 +1025,11 @@ impl Engine {
         };
         let mut out = Vec::new();
         for w in names {
-            out.push(pre(format!("Task cancelled for {w}.")));
+            out.push(pre(format!("Task cancelled for {}.", display_world(&w))));
             if let Some(mut t) = self.tasks.remove(&w) {
+                if t.run == Run::Running {
+                    self.console.push(pre(format!("Task stopped for {}.", display_world(&w))));
+                }
                 let held = t.rewind();
                 self.release_later.entry(w.clone()).or_default().extend(held);
                 self.save(&w, true, &t);
@@ -837,6 +1042,9 @@ impl Engine {
         let names: Vec<String> = self.tasks.keys().cloned().collect();
         for w in names {
             if let Some(mut t) = self.tasks.remove(&w) {
+                if t.run == Run::Running {
+                    self.console.push(pre(format!("Task stopped for {}.", display_world(&w))));
+                }
                 let held = t.rewind();
                 self.release_later.entry(w.clone()).or_default().extend(held);
                 self.save(&w, true, &t);
@@ -861,7 +1069,7 @@ impl Engine {
         vec![pre(format!("World changed to {}.", display_world(&target)))]
     }
 
-    /// `worldborder [world]`: the border is read on the level's next tick (the glue asks for it there).
+    /// `worldborder [world]`: selects the world; the glue reads its border right after the command and answers.
     fn cmd_worldborder(&mut self, rest: &[&str], who: &Who) -> Vec<String> {
         let _ = who;
         let w = match rest.first() {
@@ -872,8 +1080,8 @@ impl Engine {
             None => self.selected_world.clone(),
         };
         self.selected_world = w.clone();
-        self.border_request = Some(w.clone());
-        vec![pre(format!("Reading the world border of {} on its next tick...", display_world(&w)))]
+        self.border_request = Some(w);
+        Vec::new()
     }
 
     /// `center [x z]`: the centre of the selection; with no numbers, the player's own position.
@@ -896,10 +1104,10 @@ impl Engine {
         vec![pre(format!("Center changed to {}, {}.", number(cx), number(cz)))]
     }
 
-    /// `spawn`: the centre on the spawn point (the Overworld's; the other worlds centre on 0, 0).
+    /// `spawn`: the centre on the spawn point of the selected world (`Selection.spawn`, `world.getSpawn()`); the glue
+    /// reads it from the world's level data, 0, 0 when the glue could not read it.
     fn cmd_spawn(&mut self, who: &Who) -> Vec<String> {
-        // Only the Overworld has a spawn in the save; the other worlds centre on 0, 0.
-        let [x, z] = if self.selected_world == "world" { who.spawn.unwrap_or([0.0, 0.0]) } else { [0.0, 0.0] };
+        let [x, z] = who.spawn.unwrap_or([0.0, 0.0]);
         self.selection.cx = x;
         self.selection.cz = z;
         vec![pre(format!("Center changed to {}, {}.", number(x), number(z)))]
@@ -997,6 +1205,25 @@ impl Engine {
         }
     }
 
+    /// `limit <rate>`: chunks per second at most for the selected world's task (and the next one), 0 for none.
+    fn cmd_limit(&mut self, rest: &[&str]) -> Vec<String> {
+        let Some(n) = rest.first().and_then(|s| s.parse::<i64>().ok()) else { return vec![help_line("limit").into()] };
+        let limit = n.max(0) as u64;
+        self.selected_rate = limit;
+        let w = self.selected_world.clone();
+        if let Some(t) = self.tasks.get_mut(&w) {
+            t.rate_limit = limit;
+        }
+        if let Some(t) = self.tasks.get(&w) {
+            self.save(&w, false, t);
+        }
+        if limit == 0 {
+            vec![pre(format!("Rate limit disabled for {}.", display_world(&w)))]
+        } else {
+            vec![pre(format!("Rate limit for {} set to {limit} chunks per second.", display_world(&w)))]
+        }
+    }
+
     fn cmd_silent(&mut self) -> Vec<String> {
         self.cfg.silent = !self.cfg.silent;
         vec![pre(format!("Silent mode {}.", if self.cfg.silent { "enabled" } else { "disabled" }))]
@@ -1029,65 +1256,58 @@ impl Engine {
     /// `trim [world] [shape] [x z] [radius] [z radius] [outside|inside] [filters]`, or `trim abort`.
     fn cmd_trim(&mut self, rest: &[&str], now_ms: u64) -> Vec<String> {
         if rest.len() == 1 && rest[0].eq_ignore_ascii_case("abort") {
-            self.pending = None;
+            self.pending.remove(&self.sender);
             let gone = self.base.as_ref().is_some_and(|b| std::fs::remove_file(b.join(trim::PENDING)).is_ok());
             let line = if gone { "[Chunky] The scheduled trim is called off." } else { "[Chunky] No trim is scheduled." };
             return vec![line.into()];
         }
         let usage = help_line("trim");
-        let used = match self.apply_area(rest, usage) {
+        let used = match self.apply_area(rest, &usage) {
             Ok(n) => n,
             Err(e) => return e,
         };
         let (inside, tail): (bool, &[&str]) = if rest.len() > 6 {
             let side = rest[6].to_ascii_lowercase();
             if side != "outside" && side != "inside" {
-                return vec![usage.into()];
+                return vec![usage];
             }
             (side == "inside", &rest[7..])
         } else {
             (false, &rest[used.min(rest.len())..])
         };
-        let mut inhabited: Option<i64> = None;
-        for (n, token) in tail.iter().enumerate() {
-            let (key, value) = match token.split_once('=') {
-                None if n == 0 => ("inhabited".to_owned(), *token),
-                None => return vec![filter_invalid(token)],
-                Some((k, v)) => (k.to_ascii_lowercase(), v),
-            };
-            match key.as_str() {
-                "inhabited" if inhabited.is_none() => match parse_inhabited(value) {
-                    Ok(ticks) => inhabited = Some(ticks),
-                    Err(e) => return vec![e],
-                },
-                "inhabited" => return vec![filter_invalid(token)],
-                "unmodified" => return vec![pre("Not ported yet: trim filter unmodified (see GAPS.md).")],
-                _ => return vec![filter_invalid(token)],
-            }
-        }
+        let filters = match parse_trim_filters(tail, unix_secs()) {
+            Ok(f) => f,
+            Err(token) => return vec![filter_invalid(&token)],
+        };
+        let inhabited = filters.inhabited.map(|(_, max)| max);
         let w = self.selected_world.clone();
         let Some(wd) = self.world_dir.clone() else { return vec![pre("The world folder is not known yet.")] };
         let Ok(dir) = std::fs::canonicalize(region::dimension_dir(&wd, &w)) else {
-            return vec![pre(format!("{w} has nothing saved to trim."))];
+            return vec![pre(format!("{} has nothing saved to trim.", display_world(&w)))];
         };
-        let job = TrimJob { world: w.clone(), dir, sel: self.selection.clone(), inside, inhabited };
+        let job = TrimJob {
+            world: w.clone(),
+            dir,
+            sel: self.selection.clone(),
+            inside,
+            inhabited,
+            inhabited_min: filters.inhabited.map_or(0, |(min, _)| min),
+            unmodified: filters.unmodified.as_ref().map(|u| u.cutoff),
+        };
         let p = job.preview();
         let side = if inside { "inside" } else { "outside" };
         let mut out = vec![pre(format!(
-            "Warning: Chunks in {w} {side} of the {} region centered at {}, {} with radius {} will be permanently deleted. Please make sure you have taken a backup of your server before continuing to avoid potential damage. You will be required to restart your server fully after the task has finished. If you understand and wish to proceed, type '/chunky confirm'.",
+            "&cWarning: Chunks in {} {side} of the {} region centered at {}, {} with radius {} will be permanently deleted. Please make sure you have taken a backup of your server before continuing to avoid potential damage. You will be required to restart your server fully after the task has finished. If you understand and wish to proceed, type '/chunky confirm'.",
+            display_world(&w),
             job.sel.shape.name(),
             number(job.sel.cx),
             number(job.sel.cz),
             radius_text(&job.sel)
         ))];
-        if let Some(t) = inhabited {
-            out.push(pre(format!(
-                "Notice: Filtering chunks by a maximum inhabited time of {t} ticks. Trim may take longer than usual to complete."
-            )));
-        }
+        out.extend(filters.notices());
         out.push(pre(format!(
             "{}{} of {} saved chunks go: {} region files deleted, {} changed.",
-            if inhabited.is_some() { "At most " } else { "" },
+            if inhabited.is_some() || filters.unmodified.is_some() { "At most " } else { "" },
             p.chunks_deleted,
             p.chunks_deleted + p.chunks_kept,
             p.files_deleted,
@@ -1096,16 +1316,15 @@ impl Engine {
         out.push(pre("This cannot be undone without a backup. It runs at the next server start, before the world loads."));
         out.push(pre(format!("Type '/chunky confirm' within {} s to schedule it.", CONFIRM_MS / 1000)));
         out.extend(p.errors.iter().map(|e| pre(format!("Could not read {e}"))));
-        self.pending = Some((Pending::Trim(job), now_ms + CONFIRM_MS));
+        self.pending.insert(self.sender.clone(), (Pending::Trim(job), now_ms + CONFIRM_MS));
         out
     }
 
     /// `confirm`: runs the action a command asked for (start over, cancel, trim).
     fn cmd_confirm(&mut self, now_ms: u64) -> Vec<String> {
-        let Some((action, until)) = self.pending.take() else { return vec![pre("Nothing to confirm!")] };
-        if now_ms > until {
-            return vec![pre("Nothing to confirm!")];
-        }
+        // Chunky drops every expired action first, then takes the sender's own.
+        self.pending.retain(|_, (_, until)| now_ms <= *until);
+        let Some((action, _)) = self.pending.remove(&self.sender) else { return vec![pre("Nothing to confirm!")] };
         match action {
             Pending::Start(sel, w) => self.start_task(&w, sel),
             Pending::Cancel(world) => self.cancel_now(world.as_deref()),
@@ -1119,7 +1338,7 @@ impl Engine {
         match std::fs::write(base.join(trim::PENDING), trim::render(&job)) {
             Ok(()) => vec![pre(format!(
                 "Trim of {} scheduled. Back the world up, then stop and start the server to apply it. '/chunky trim abort' calls it off.",
-                job.world
+                display_world(&job.world)
             ))],
             Err(e) => vec![pre(format!("Could not schedule the trim: {e}"))],
         }
@@ -1143,6 +1362,7 @@ impl Engine {
     fn reload_config(&mut self) -> Vec<String> {
         let Some(base) = self.base.clone() else { return vec![pre("The config folder is not known yet.")] };
         self.cfg = std::fs::read_to_string(base.join("config.toml")).map(|t| Config::parse(&t)).unwrap_or_default();
+        crate::horizon_chunky_core::lang::set_language(&self.cfg.language);
         Vec::new()
     }
 
@@ -1163,12 +1383,7 @@ fn pre(text: impl AsRef<str>) -> String {
 }
 
 fn world_not_found(name: &str) -> String {
-    pre(format!(
-        "World {name} not found. Available worlds: {}, {}, {}",
-        display_world("world"),
-        display_world("world_nether"),
-        display_world("world_the_end")
-    ))
+    pre(format!("World {name} not found. Available worlds: {}", available_worlds().join(", ")))
 }
 
 fn shape_not_found(name: &str) -> String {
@@ -1183,23 +1398,124 @@ fn filter_invalid(token: &str) -> String {
     pre(format!("Trim filter {token} is invalid. Available filters: inhabited, unmodified"))
 }
 
-/// `inhabited` ticks: a number, or a number with `s`, `m`, `h` or `d` (seconds, minutes, hours, days). A range is not
-/// ported yet.
-fn parse_inhabited(value: &str) -> Result<i64, String> {
-    if value.contains("..") {
-        return Err(pre("Not ported yet: an inhabited range (see GAPS.md)."));
+fn unix_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
+}
+
+/// Seconds in a trim filter's time unit: `s`, `m`, `h` or `d`.
+fn time_unit_secs(c: char) -> Option<f64> {
+    match c.to_ascii_lowercase() {
+        's' => Some(1.0),
+        'm' => Some(60.0),
+        'h' => Some(3600.0),
+        'd' => Some(86_400.0),
+        _ => None,
     }
-    let (amount, mul) = match value.chars().last().map(|c| c.to_ascii_lowercase()) {
-        Some('s') => (&value[..value.len() - 1], 20.0),
-        Some('m') => (&value[..value.len() - 1], 1200.0),
-        Some('h') => (&value[..value.len() - 1], 72_000.0),
-        Some('d') => (&value[..value.len() - 1], 1_728_000.0),
-        _ => (value, 1.0),
-    };
-    match amount.parse::<f64>() {
-        Ok(v) if v.is_finite() && v >= 0.0 => Ok((v * mul).round() as i64),
-        _ => Err(filter_invalid(value)),
+}
+
+/// `TrimFilters.parseAmount`: a finite, non-negative number whose last character is a digit.
+fn parse_amount(s: &str) -> Option<f64> {
+    if s.is_empty() || !s.ends_with(|c: char| c.is_ascii_digit()) {
+        return None;
     }
+    s.parse::<f64>().ok().filter(|v| v.is_finite() && *v >= 0.0)
+}
+
+/// Ticks: a number, or a number with a time unit (`30s`, `5m`, `2h`, `1d`; 20 ticks a second).
+fn parse_ticks(value: &str) -> Option<i64> {
+    match value.chars().last().and_then(time_unit_secs) {
+        Some(secs) => parse_amount(&value[..value.len() - 1]).map(|n| (n * secs * 20.0).round() as i64),
+        None => parse_amount(value).map(|n| n.round() as i64),
+    }
+}
+
+/// `inhabited=<max>` or `inhabited=<min>..<max>` (either end may be left off, not both): (min, max) in ticks.
+fn parse_inhabited(value: &str) -> Option<(i64, i64)> {
+    let Some(at) = value.find("..") else { return parse_ticks(value).map(|max| (0, max)) };
+    let (min, max) = (&value[..at], &value[at + 2..]);
+    if min.is_empty() && max.is_empty() {
+        return None;
+    }
+    let min = if min.is_empty() { Some(0) } else { parse_ticks(min) }?;
+    let max = if max.is_empty() { Some(i64::MAX) } else { parse_ticks(max) }?;
+    (min <= max).then_some((min, max))
+}
+
+/// A parsed `unmodified=<amount><unit>`.
+struct Unmodified {
+    amount: f64,
+    unit: char,
+    /// Unix seconds: chunks last saved at or before it go.
+    cutoff: i64,
+}
+
+/// `unmodified=<amount><unit>`: a number and one of `s`, `m`, `h`, `d`.
+fn parse_unmodified(value: &str, now_secs: i64) -> Option<Unmodified> {
+    let unit = value.chars().last()?;
+    let secs = time_unit_secs(unit)?;
+    let amount = parse_amount(&value[..value.len() - 1])?;
+    Some(Unmodified { amount, unit: unit.to_ascii_lowercase(), cutoff: now_secs - (amount * secs).round() as i64 })
+}
+
+#[derive(Default)]
+struct TrimFilters {
+    inhabited: Option<(i64, i64)>,
+    unmodified: Option<Unmodified>,
+}
+
+impl TrimFilters {
+    /// The notice lines Chunky prints for each filter (`sendNotice`).
+    fn notices(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Some((min, max)) = self.inhabited {
+            let (lo, hi) = (number(min as f64), number(max as f64));
+            let text = if min <= 0 {
+                tr("format_trim_confirm_inhabited", &[hi.as_str()])
+            } else if max == i64::MAX {
+                tr("format_trim_confirm_inhabited_minimum", &[lo.as_str()])
+            } else {
+                tr("format_trim_confirm_inhabited_range", &[lo.as_str(), hi.as_str()])
+            };
+            out.push(pre(text));
+        }
+        if let Some(u) = &self.unmodified {
+            let unit = match u.unit {
+                'm' => "minute",
+                'h' => "hour",
+                'd' => "day",
+                _ => "second",
+            };
+            let key = if u.amount == 1.0 { format!("time_{unit}") } else { format!("time_{unit}s") };
+            let amount = number(u.amount);
+            let span = tr(&key, &[amount.as_str()]);
+            out.push(pre(tr("format_trim_confirm_unmodified", &[span.as_str()])));
+        }
+        out
+    }
+}
+
+/// `TrimFilters.parse`: the words after the side. A bare first word is `inhabited=<word>`; each key at most once.
+/// A word that does not parse comes back as the error (Chunky's `IllegalArgumentException` message).
+fn parse_trim_filters(tokens: &[&str], now_secs: i64) -> Result<TrimFilters, String> {
+    let mut out = TrimFilters::default();
+    let mut seen: Vec<String> = Vec::new();
+    for (i, token) in tokens.iter().enumerate() {
+        let (key, value) = match token.split_once('=') {
+            None if i == 0 => ("inhabited".to_owned(), *token),
+            None => return Err((*token).to_owned()),
+            Some((k, v)) => (k.to_ascii_lowercase(), v),
+        };
+        if seen.contains(&key) {
+            return Err((*token).to_owned());
+        }
+        match key.as_str() {
+            "inhabited" => out.inhabited = Some(parse_inhabited(value).ok_or_else(|| (*token).to_owned())?),
+            "unmodified" => out.unmodified = Some(parse_unmodified(value, now_secs).ok_or_else(|| (*token).to_owned())?),
+            _ => return Err((*token).to_owned()),
+        }
+        seen.push(key);
+    }
+    Ok(out)
 }
 
 /// "100 by 50" for rectangles and ellipses, one number otherwise (Chunky's `Formatting.radius`).
@@ -1220,7 +1536,8 @@ fn number(v: f64) -> String {
 fn progress_line(w: &str, t: &Task) -> String {
     let eta = t.eta_s().unwrap_or(0);
     format!(
-        "[Chunky] Task running for {w}. Processed: {} chunks ({:.2}%), ETA: {}:{:02}:{:02}, Rate: {:.1} cps, Current: {}, {}",
+        "[Chunky] Task running for {}. Processed: {} chunks ({:.2}%), ETA: {}:{:02}:{:02}, Rate: {:.1} cps, Current: {}, {}",
+        display_world(w),
         t.done,
         t.percent(),
         eta / 3600,
@@ -1232,8 +1549,17 @@ fn progress_line(w: &str, t: &Task) -> String {
     )
 }
 
-/// The help line of a command, as Chunky's `help_*` message (its colour codes left out).
-fn help_line(name: &str) -> &'static str {
+/// The help line of a command, as Chunky's `help_*` message: the usage in green, the description plain (`&` colour
+/// codes, which the glue turns into text colours).
+fn help_line(name: &str) -> String {
+    let plain = help_plain(name);
+    match plain.split_once(" - ") {
+        Some((usage, description)) => format!("&2{usage}&r - {description}"),
+        None => plain.to_owned(),
+    }
+}
+
+fn help_plain(name: &str) -> &'static str {
     match name {
         "cancel" => "chunky cancel - Stop and delete current or saved tasks",
         "center" => "chunky center <x> <z> - Set the center block location",
@@ -1261,7 +1587,7 @@ fn help_line(name: &str) -> &'static str {
 
 /// Chunky's help menu (`HelpCommand`): every command for the console; eight to a page for a player.
 fn help(page: Option<i64>, player: bool) -> Vec<String> {
-    const LISTED: [&str; 18] = [
+    const LISTED: [&str; 19] = [
         "start",
         "pause",
         "continue",
@@ -1276,6 +1602,7 @@ fn help(page: Option<i64>, player: bool) -> Vec<String> {
         "pattern",
         "silent",
         "quiet",
+        "limit",
         "trim",
         "selection",
         "progress",
@@ -1287,10 +1614,10 @@ fn help(page: Option<i64>, player: bool) -> Vec<String> {
         Some(p) => ((p - 1).max(0) as usize) % (last + 1),
     };
     let (first, end) = if player { (8 * index, (8 * index + 8).min(LISTED.len())) } else { (0, LISTED.len()) };
-    let mut out = vec!["Chunky Commands".to_owned()];
-    out.extend(LISTED[first..end].iter().map(|c| help_line(c).to_owned()));
+    let mut out = vec!["&aChunky Commands&r".to_owned()];
+    out.extend(LISTED[first..end].iter().map(|c| help_line(c)));
     if player && index != last {
-        out.push(format!("Type /chunky help {} to see more.", index + 2));
+        out.push(format!("Type &a/chunky help {}&r to see more.", index + 2));
     }
     out
 }
@@ -1515,11 +1842,18 @@ mod tests {
         assert_eq!((e.selection.cx, e.selection.cz, e.selection.radius), (10.7, -3.2, 3000.0));
         assert_eq!(e.selection.shape, Shape::Circle);
         assert!(e.command("chunky shape octagon", &w, 0)[0].contains("not found"));
-        e.command("chunky worldborder", &w, 0);
-        assert!(e.take_border_request("minecraft:overworld"));
-        assert!(!e.take_border_request("minecraft:overworld"));
-        e.set_border([0.0, 0.0], 20000.0);
+        assert!(e.command("chunky worldborder", &w, 0).is_empty());
+        assert_eq!(e.take_border_world().as_deref(), Some("world"));
+        assert_eq!(e.take_border_world(), None);
+        let lines = e.set_border([0.0, 0.0], 20000.0, 29_999_984.0);
         assert_eq!(e.selection.radius, 10000.0);
+        assert_eq!(lines, vec!["[Chunky] Center changed to 0, 0.", "[Chunky] Radius changed to 10000."]);
+        let big = e.set_border([5.0, -7.5], 100.0, 40.0);
+        assert_eq!(big[0], "[Chunky] Center changed to 5, -7.5.");
+        assert_eq!(
+            big[2],
+            "[Chunky] &eNotice: Your world border is currently set larger than the maximum of 40 configured in server.properties. This is normally an error and can cause issues."
+        );
     }
 
     #[test]
@@ -1538,19 +1872,20 @@ mod tests {
     fn world_with_region(name: &str, chunks: &[(usize, &str)]) -> PathBuf {
         let d = tmp(name);
         let dim = d.join("dimensions/minecraft/overworld");
-        let nbts: Vec<(usize, Vec<u8>)> = chunks.iter().map(|(i, st)| (*i, crate::region::testutil::nbt(st, 0))).collect();
-        crate::region::testutil::write_region(&crate::region::region_path(&dim, "region", (0, 0)), &nbts);
+        let nbts: Vec<(usize, Vec<u8>)> = chunks.iter().map(|(i, st)| (*i, crate::horizon_chunky_core::region::testutil::nbt(st, 0))).collect();
+        crate::horizon_chunky_core::region::testutil::write_region(&crate::horizon_chunky_core::region::region_path(&dim, "region", (0, 0)), &nbts);
         d
     }
 
     #[test]
     fn spawn_corners_and_two_radii() {
         let mut e = engine(None);
-        let w = Who { at: None, spawn: Some([120.0, -48.0]) };
+        let w = Who { at: None, spawn: Some([120.0, -48.0]), ..Default::default() };
         e.command("chunky spawn", &w, 0);
         assert_eq!((e.selection.cx, e.selection.cz), (120.0, -48.0));
         e.command("chunky world world_nether", &w, 0);
-        e.command("chunky spawn", &w, 0);
+        // The glue passes the selected world's spawn (`Who::spawn`): the overworld's is not the nether's.
+        e.command("chunky spawn", &Who::default(), 0);
         assert_eq!((e.selection.cx, e.selection.cz), (0.0, 0.0));
         e.command("chunky corners 0 0 15 31", &w, 0);
         let s = &e.selection;
@@ -1673,6 +2008,49 @@ mod tests {
     }
 
     #[test]
+    fn a_host_radius_limit_refuses_a_bigger_start() {
+        let d = tmp("radius-limit");
+        let mut e = engine(None);
+        e.set_base(d.clone());
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join(".chunky.properties"), "radius-limit=100\n").unwrap();
+        let r = e.command("chunky start world square 0 0 500", &Who::default(), 0);
+        assert_eq!(
+            r,
+            ["[Chunky] Your host has limited the maximum pre-generation radius to 100 to avoid excessive disk space usage. Reduce the radius or contact your host if you wish to have this limit removed."]
+        );
+        assert!(e.command("chunky start world square 0 0 100", &Who::default(), 0)[0].contains("Task started"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn trim_filters_parse_ranges_units_and_unmodified() {
+        let f = parse_trim_filters(&["inhabited=5m", "unmodified=2d"], 1_000_000).unwrap();
+        assert_eq!(f.inhabited, Some((0, 6000)));
+        let u = f.unmodified.as_ref().unwrap();
+        assert_eq!((u.cutoff, u.unit), (1_000_000 - 172_800, 'd'));
+        assert_eq!(parse_trim_filters(&["50"], 0).unwrap().inhabited, Some((0, 50)));
+        // A range, an open end on either side, and the words that are refused.
+        assert_eq!(parse_trim_filters(&["inhabited=100..2s"], 0).err(), Some("inhabited=100..2s".to_owned()));
+        assert_eq!(parse_trim_filters(&["inhabited=40..2s"], 0).unwrap().inhabited, Some((40, 40)));
+        assert_eq!(parse_trim_filters(&["inhabited=..1m"], 0).unwrap().inhabited, Some((0, 1200)));
+        assert_eq!(parse_trim_filters(&["inhabited=1m.."], 0).unwrap().inhabited, Some((1200, i64::MAX)));
+        assert_eq!(parse_trim_filters(&["inhabited=.."], 0).err(), Some("inhabited=..".to_owned()));
+        assert_eq!(parse_trim_filters(&["inhabited=5", "inhabited=6"], 0).err(), Some("inhabited=6".to_owned()));
+        assert_eq!(parse_trim_filters(&["unmodified=5"], 0).err(), Some("unmodified=5".to_owned()));
+        assert_eq!(parse_trim_filters(&["colour=red"], 0).err(), Some("colour=red".to_owned()));
+        assert_eq!(parse_trim_filters(&["inhabited=5", "50"], 0).err(), Some("50".to_owned()));
+        // The notices Chunky prints, in its words (singular for exactly one unit).
+        assert_eq!(
+            parse_trim_filters(&["inhabited=1m..", "unmodified=1h"], 0).unwrap().notices(),
+            [
+                "[Chunky] &eNotice: Filtering chunks by a minimum inhabited time of 1200 ticks. Trim may take longer than usual to complete.",
+                "[Chunky] &eNotice: Filtering chunks that have not been modified in the last 1 hour. Chunks without a known modification time will not be deleted.",
+            ]
+        );
+    }
+
+    #[test]
     fn reload_tasks_waits_for_pause_and_reload_config_reads_the_file() {
         let d = tmp("reload");
         let mut e = engine(None);
@@ -1686,5 +2064,99 @@ mod tests {
         e.command("chunky reload", &Who::default(), 0);
         assert!(e.cfg.max_in_flight == 3 && e.cfg.force_load_existing_chunks);
         let _ = std::fs::remove_dir_all(d);
+    }
+
+    fn player(name: &str) -> Who {
+        Who { at: Some(([0.0, 0.0], "world".into())), sender: name.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn a_pending_action_is_confirmed_only_by_the_sender_who_asked() {
+        let mut e = engine(None);
+        e.command("chunky start world square 0 0 100", &Who::default(), 0);
+        let (alice, bob) = (player("Alice"), player("Bob"));
+        assert!(e.command("chunky cancel", &alice, 0)[0].contains("If you are sure you want to cancel"));
+        assert_eq!(e.command("chunky confirm", &bob, 1), vec!["[Chunky] Nothing to confirm!"]);
+        assert!(e.tasks.contains_key("world"));
+        assert_eq!(e.command("chunky confirm", &alice, 2)[0], "[Chunky] Cancelling all tasks.");
+        assert!(e.tasks.is_empty());
+        assert_eq!(e.command("chunky confirm", &alice, 3), vec!["[Chunky] Nothing to confirm!"]);
+    }
+
+    #[test]
+    fn the_owner_is_told_when_the_task_finishes_and_the_console_when_it_stops() {
+        let mut e = engine(None);
+        e.command("chunky start world square 0 0 16", &player("Alice"), 0);
+        let mut notify = Vec::new();
+        for n in 0..5000 {
+            let act = e.tick("minecraft:overworld", n * 50);
+            for c in &act.hold {
+                e.chunk_loaded("minecraft:overworld", *c);
+            }
+            notify.extend(act.notify);
+            if e.tasks.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(notify.len(), 1, "{notify:?}");
+        assert_eq!(notify[0].0, "Alice");
+        assert!(notify[0].1.starts_with("[Chunky] Task finished for world. Processed:"), "{notify:?}");
+
+        e.command("chunky start world square 0 0 500", &Who::default(), 0);
+        e.command("chunky pause", &Who::default(), 0);
+        assert_eq!(e.take_console(), vec!["[Chunky] Task stopped for world."]);
+        assert!(e.take_console().is_empty());
+    }
+
+    #[test]
+    fn the_rate_limit_caps_chunks_per_second() {
+        let mut e = engine(None);
+        let console = Who::default();
+        assert_eq!(
+            e.command("chunky limit 20", &console, 0),
+            vec!["[Chunky] Rate limit for world set to 20 chunks per second."]
+        );
+        e.command("chunky start world square 0 0 500", &console, 0);
+        let mut held = 0;
+        for n in 0..=20 {
+            held += e.tick("minecraft:overworld", n * 50).hold.len();
+        }
+        assert_eq!(held, 20);
+        assert_eq!(e.command("chunky limit 0", &console, 0), vec!["[Chunky] Rate limit disabled for world."]);
+        assert_eq!(e.tick("minecraft:overworld", 1100).hold.len(), e.cfg.max_in_flight - 20);
+        assert_eq!(e.command("chunky limit x", &console, 0), vec!["&2chunky limit <rate>&r - Set the max chunks per second"]);
+    }
+
+    #[test]
+    fn a_custom_dimension_is_a_world_named_by_its_id() {
+        register_dimension("mymod:void");
+        register_dimension("minecraft:overworld");
+        assert_eq!(canon_world("MyMod:Void"), Some("mymod:void"));
+        assert_eq!(canon_world("mymod:other"), None);
+        assert_eq!(dimension_of("mymod:void"), "mymod:void");
+        assert_eq!(dimension_of("world_nether"), "minecraft:the_nether");
+        assert_eq!(display_world("mymod:void"), "mymod:void");
+        assert!(available_worlds().contains(&"mymod:void".to_owned()));
+        assert_eq!(region::dimension_dir(Path::new("/w"), "mymod:void"), PathBuf::from("/w/dimensions/mymod/void"));
+    }
+
+    #[test]
+    fn the_trim_filter_words_complete_the_keys_not_yet_used() {
+        let both = vec![("inhabited=".to_owned(), 0), ("unmodified=".to_owned(), 0)];
+        assert_eq!(trim_filter_suggestions(""), both);
+        assert_eq!(trim_filter_suggestions("i"), vec![("inhabited=".to_owned(), 0)]);
+        assert_eq!(trim_filter_suggestions("inhabited=5 un"), vec![("unmodified=".to_owned(), 12)]);
+        assert_eq!(trim_filter_suggestions("inhabited=5 "), vec![("unmodified=".to_owned(), 12)]);
+        assert!(trim_filter_suggestions("inhabited=5 unmodified=2d ").is_empty());
+        assert!(trim_filter_suggestions("inhabited=5").is_empty());
+    }
+
+    #[test]
+    fn the_unmodified_notice_names_its_unit_in_the_language_in_use() {
+        let f = parse_trim_filters(&["unmodified=2d"], 0).unwrap();
+        assert_eq!(
+            f.notices(),
+            ["[Chunky] &eNotice: Filtering chunks that have not been modified in the last 2 days. Chunks without a known modification time will not be deleted."]
+        );
     }
 }

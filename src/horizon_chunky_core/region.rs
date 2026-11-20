@@ -5,7 +5,7 @@
 //! four-byte timestamps; a chunk's record is a big-endian length, a compression byte (1 gzip, 2 zlib, 3 none, 4 lz4;
 //! +128 = the data lives in `c.<x>.<z>.mcc` beside the file) and the compressed NBT.
 
-use crate::geom::Chunk;
+use crate::horizon_chunky_core::geom::Chunk;
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -18,6 +18,10 @@ pub const KINDS: [&str; 3] = ["region", "entities", "poi"];
 /// The folder of one dimension inside a world folder: `dimensions/minecraft/<name>` (the layout of 26.x saves); a
 /// world in the older layout (`region/` at the top, `DIM-1/`, `DIM1/`) is used when the new folder is missing.
 pub fn dimension_dir(world_dir: &Path, world: &str) -> PathBuf {
+    // A custom dimension (its id `namespace:path`) lives in `dimensions/<namespace>/<path>`.
+    if let Some((namespace, path)) = world.split_once(':') {
+        return world_dir.join("dimensions").join(namespace).join(path);
+    }
     let (new, old) = match world {
         "world_nether" => ("the_nether", Some("DIM-1")),
         "world_the_end" => ("the_end", Some("DIM1")),
@@ -70,6 +74,22 @@ pub fn read_locations(file: &mut std::fs::File) -> std::io::Result<[u32; 1024]> 
         return Ok(out);
     }
     file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut head)?;
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u32::from_be_bytes([head[i * 4], head[i * 4 + 1], head[i * 4 + 2], head[i * 4 + 3]]);
+    }
+    Ok(out)
+}
+
+/// The timestamp table of a region file (seconds, 0 for a chunk that was never saved); a file shorter than its header
+/// has none.
+pub fn read_timestamps(file: &mut std::fs::File) -> std::io::Result<[u32; 1024]> {
+    let mut head = vec![0u8; 4096];
+    let mut out = [0u32; 1024];
+    if file.metadata()?.len() < 8192 {
+        return Ok(out);
+    }
+    file.seek(SeekFrom::Start(4096))?;
     file.read_exact(&mut head)?;
     for (i, o) in out.iter_mut().enumerate() {
         *o = u32::from_be_bytes([head[i * 4], head[i * 4 + 1], head[i * 4 + 2], head[i * 4 + 3]]);
@@ -144,6 +164,17 @@ pub fn nbt_string(nbt: &[u8], name: &str) -> Option<String> {
 pub fn nbt_long(nbt: &[u8], name: &str) -> Option<i64> {
     let b = find_tag(nbt, 4, name)?.get(..8)?;
     Some(i64::from_be_bytes(b.try_into().ok()?))
+}
+
+/// The first named int tag `name` (`xPos`, `zPos`).
+pub fn nbt_int(nbt: &[u8], name: &str) -> Option<i32> {
+    let b = find_tag(nbt, 3, name)?.get(..4)?;
+    Some(i32::from_be_bytes(b.try_into().ok()?))
+}
+
+/// Does the NBT hold a tag `name` of type `kind` (1 byte, 3 int, 4 long, 8 string)?
+pub fn nbt_has(nbt: &[u8], kind: u8, name: &str) -> bool {
+    find_tag(nbt, kind, name).is_some()
 }
 
 /// Is the chunk's record fully generated (`Status` `minecraft:full`)? None when it can't be told.

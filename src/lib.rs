@@ -3,8 +3,9 @@
 //!
 //! - Commands: Chunky's tree from `register_commands`, every usage at operator level 2. arismoko hands over the
 //!   parsed invocation, not the typed line, so `run_mod_command` rebuilds the line from its literals and then its
-//!   arguments, and the engine parses that line as before. Shape and side are words, not literals, because the
-//!   rebuilt line cannot place a literal between arguments; tab completion therefore lists no shape names.
+//!   arguments, and the engine parses that line as before. World, shape, side and the trim filters are registered
+//!   argument types (`chunky:world`, `chunky:shape`, `chunky:side`, `chunky:filters`): they accept what the engine
+//!   checks and complete from Chunky's lists, as its suggestion providers do.
 //! - Chunk tickets: a running task holds its chunks through the mod's own ticket controller `chunky:tasks`, from
 //!   `level_tick_pre`. The engine learns about loaded chunks by diffing `level_loaded_chunks` while a task runs
 //!   there, in place of Horizon's `chunk_load` and `chunk_unload` hooks. Tickets a previous run left in the save
@@ -12,13 +13,18 @@
 //! - Border: read when `chunky worldborder` asks for it (`level_world_border`), as before. Nothing is set.
 //! - Config: `config/chunky/config.toml` and the saved tasks are read at server start, the trim is applied before
 //!   any world opens, and the tasks are saved at server stop, as in the Horizon port. No `register_configs`, so no
-//!   default file is written.
+//!   default file is written. `language` picks the message file (`lang/<code>.json`); every line the mod prints goes
+//!   through `lang::localize` on its way out.
+
+pub mod horizon_chunky_core;
 use horizon_chunky_core as chunky;
-use horizon_chunky_core::engine::{Who, canon_world, set_level_name};
+use crate::horizon_chunky_core::engine::{Who, available_worlds, canon_world, dimension_of, display_world, register_dimension, set_level_name};
 use mod_api::text::TextStyle;
 use mod_api::{
-    ChunkRef, Command, CommandArgumentValue, CommandSource, Flow, Hooks, HostSide, LevelRef,
-    LevelTickPostEvent, LevelTickPreEvent, PlayerCommandEvent, RegisterCommandsEvent, Registrar,
+    ChunkRef, Command, CommandArgumentError, CommandArgumentKind, CommandArgumentType,
+    CommandArgumentValue, CommandSender, CommandSource, CommandSuggestion, Flow, Hooks, HostSide, LevelRef,
+    LevelTickPostEvent, LevelTickPreEvent, PlayerCommandEvent, RegisterCommandsEvent, RegisterNodeCommandsEvent, Registrar,
+    NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
     RegistrationContext, RunModCommandEvent, PlayerCommandsSentEvent, ServerAboutToStartEvent, ServerHost, ServerStoppingEvent,
     Text, TicketController, TicketOwner,
 };
@@ -32,14 +38,111 @@ const OWNER: TicketOwner = TicketOwner::Block([0, 0, 0]);
 /// plugin.yml: `chunky.command` (the root, default op) and the operator level the usages are registered at.
 const ROOT_NODE: &str = "chunky.command";
 const LEVEL: u8 = 2;
-/// Bukkit's permission message, which plugin.yml gives every permission-gated command (no `permission-message`).
-const NO_PERMISSION: &str = "I'm sorry, but you do not have permission to perform this command. Please contact the server administrators if you believe that this is in error.";
 
-/// The red permission message for a player without the node.
+/// Brigadier's answer for a literal the sender may not use. Chunky's Paper build puts its permission on the command
+/// tree, so a player without the node never sees the command (the plain-Bukkit fallback would print a permission message).
+const UNKNOWN_COMMAND: &str = "Unknown or incomplete command, see below for error";
+
+/// The answer for a player without the node: the command is hidden, as Chunky's Brigadier tree hides it.
 fn no_permission() -> Text {
     let mut style = TextStyle::default();
     style.color = Some("#FF5555".to_string());
-    Text::literal(NO_PERMISSION).with_style(style)
+    Text::literal(UNKNOWN_COMMAND).with_style(style)
+}
+
+/// One run of a message with one formatting, from Chunky's `&` colour codes.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Segment {
+    text: String,
+    color: Option<&'static str>,
+    bold: bool,
+    italic: bool,
+    underlined: bool,
+    strikethrough: bool,
+    obfuscated: bool,
+}
+
+/// What `&<code>` gives (Bukkit's `ChatColor`): `0`-`9`, `a`-`f` are colours.
+fn legacy_color(c: char) -> Option<&'static str> {
+    Some(match c.to_ascii_lowercase() {
+        '0' => "#000000",
+        '1' => "#0000AA",
+        '2' => "#00AA00",
+        '3' => "#00AAAA",
+        '4' => "#AA0000",
+        '5' => "#AA00AA",
+        '6' => "#FFAA00",
+        '7' => "#AAAAAA",
+        '8' => "#555555",
+        '9' => "#5555FF",
+        'a' => "#55FF55",
+        'b' => "#55FFFF",
+        'c' => "#FF5555",
+        'd' => "#FF55FF",
+        'e' => "#FFFF55",
+        'f' => "#FFFFFF",
+        _ => return None,
+    })
+}
+
+/// Splits a message at its `&` codes (`translateAlternateColorCodes('&', ...)`): a colour code sets the colour and
+/// clears the formats, `&r` resets, `&k &l &m &n &o` add a format. An `&` before anything else stays as typed.
+fn legacy_segments(line: &str) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut cur = Segment::default();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        let code = if c == '&' { chars.peek().copied() } else { None };
+        let Some(code) = code else {
+            cur.text.push(c);
+            continue;
+        };
+        let lower = code.to_ascii_lowercase();
+        let known = legacy_color(code).is_some() || matches!(lower, 'r' | 'k' | 'l' | 'm' | 'n' | 'o');
+        if !known {
+            cur.text.push(c);
+            continue;
+        }
+        chars.next();
+        if !cur.text.is_empty() {
+            out.push(cur.clone());
+        }
+        cur.text.clear();
+        match (legacy_color(code), lower) {
+            (Some(color), _) => cur = Segment { color: Some(color), ..Segment::default() },
+            (None, 'r') => cur = Segment::default(),
+            (None, 'k') => cur.obfuscated = true,
+            (None, 'l') => cur.bold = true,
+            (None, 'm') => cur.strikethrough = true,
+            (None, 'n') => cur.underlined = true,
+            _ => cur.italic = true,
+        }
+    }
+    if !cur.text.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// A message with Chunky's `&` colour codes as Horizon text.
+fn legacy_text(line: &str) -> Text {
+    let mut text = Text::literal("");
+    for seg in legacy_segments(&chunky::lang::localize(line)) {
+        let mut style = TextStyle::default();
+        style.color = seg.color.map(str::to_owned);
+        style.bold = seg.bold.then_some(true);
+        style.italic = seg.italic.then_some(true);
+        style.underlined = seg.underlined.then_some(true);
+        style.strikethrough = seg.strikethrough.then_some(true);
+        style.obfuscated = seg.obfuscated.then_some(true);
+        text = text.append(Text::literal(seg.text).with_style(style));
+    }
+    text
+}
+
+/// A message without its colour codes, for the console log.
+fn strip_legacy(line: &str) -> String {
+    legacy_segments(line).into_iter().map(|s| s.text).collect()
 }
 
 #[derive(Default)]
@@ -55,11 +158,46 @@ struct Mod {
 }
 
 fn log(line: &str) {
-    eprintln!("[chunky] {line}");
+    eprintln!("[chunky] {}", strip_legacy(&chunky::lang::localize(line)));
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Tells the online player called `name` one line, as Chunky tells a task's owner.
+fn tell_named(host: &mut dyn ServerHost, name: &str, line: &str) {
+    let players = host.players().server_players();
+    for player in players {
+        if player.name(&*host).is_some_and(|n| n.eq_ignore_ascii_case(name)) {
+            let _ = player.tell(host, legacy_text(line));
+        }
+    }
+}
+
+/// Chunky's Bukkit build sets `pause-when-empty-seconds` to 0 in server.properties (a paused server stops the tasks)
+/// and asks for a restart. True when the file was changed; only that one line is rewritten.
+fn disable_pause_when_empty() -> bool {
+    let Ok(text) = std::fs::read_to_string("server.properties") else { return false };
+    let mut changed = false;
+    let mut out = String::new();
+    for line in text.lines() {
+        let is_setting = line.split_once('=').is_some_and(|(k, v)| {
+            k.trim() == "pause-when-empty-seconds" && v.trim().parse::<i64>().is_ok_and(|n| n > 0)
+        });
+        if is_setting {
+            out.push_str("pause-when-empty-seconds=0\n");
+            changed = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !changed {
+        return false;
+    }
+    let tmp = "server.properties.tmp";
+    std::fs::write(tmp, out).is_ok() && std::fs::rename(tmp, "server.properties").is_ok()
 }
 
 /// `level-name` from server.properties, `world` when it is not there.
@@ -72,20 +210,21 @@ fn level_name(properties: &str) -> String {
         .unwrap_or_else(|| "world".into())
 }
 
+const SHAPES: [&str; 9] = [
+    "square",
+    "circle",
+    "rectangle",
+    "ellipse",
+    "diamond",
+    "triangle",
+    "pentagon",
+    "hexagon",
+    "star",
+];
+
 /// Chunky's command tree (`BrigadierCommand.build` in Chunky's common module), one usage per line. Each
 /// subcommand usage carries its node (`permission_node`, `register_commands`).
 fn usages() -> Vec<String> {
-    const SHAPES: [&str; 9] = [
-        "square",
-        "circle",
-        "rectangle",
-        "ellipse",
-        "diamond",
-        "triangle",
-        "pentagon",
-        "hexagon",
-        "star",
-    ];
     const PATTERNS: [&str; 7] = [
         "concentric",
         "loop",
@@ -100,18 +239,18 @@ fn usages() -> Vec<String> {
         "chunky help",
         "chunky help [page:integer]",
         "chunky start",
-        "chunky start <world:word>",
+        "chunky start <world:chunky:world>",
         "chunky pause",
-        "chunky pause <world:word>",
+        "chunky pause <world:chunky:world>",
         "chunky continue",
-        "chunky continue <world:word>",
+        "chunky continue <world:chunky:world>",
         "chunky cancel",
-        "chunky cancel <world:word>",
+        "chunky cancel <world:chunky:world>",
         "chunky progress",
         "chunky world",
-        "chunky world <world:word>",
+        "chunky world <world:chunky:world>",
         "chunky worldborder",
-        "chunky worldborder <world:word>",
+        "chunky worldborder <world:chunky:world>",
         "chunky center",
         "chunky center <x:word> <z:word>",
         "chunky spawn",
@@ -129,8 +268,9 @@ fn usages() -> Vec<String> {
         "chunky reload tasks",
         "chunky trim",
         "chunky trim abort",
-        "chunky trim <world:word>",
+        "chunky trim <world:chunky:world>",
         "chunky confirm",
+        "chunky pattern csv",
         "chunky pattern csv <name:word>",
     ]
     .into_iter()
@@ -144,12 +284,12 @@ fn usages() -> Vec<String> {
     }
     // Shape and side are arguments here (see the module doc); the engine checks the words.
     usages.push(
-        "chunky start <world:word> <shape:word> [x:word] [z:word] [rx:word] [rz:word]".into(),
+        "chunky start <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]".into(),
     );
     usages
-        .push("chunky trim <world:word> <shape:word> [x:word] [z:word] [rx:word] [rz:word]".into());
+        .push("chunky trim <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]".into());
     usages.push(
-        "chunky trim <world:word> <shape:word> <x:word> <z:word> <rx:word> <rz:word> <side:word> [filters:text]".into(),
+        "chunky trim <world:chunky:world> <shape:chunky:shape> <x:word> <z:word> <rx:word> <rz:word> <side:chunky:side> [filters:chunky:filters]".into(),
     );
     usages
 }
@@ -187,6 +327,80 @@ fn permission_node(sub: &str) -> Option<String> {
         .then(|| format!("chunky.command.{sub}"))
 }
 
+/// A typed Boolean node by name; every name used here is declared in `permission_gather_nodes`.
+fn typed(name: &str) -> PermissionNode {
+    PermissionNode::new(name, PermissionValueType::Boolean)
+}
+
+/// A word argument that accepts anything (the engine answers a wrong world or shape with Chunky's own line) and
+/// completes from a list, as Chunky's `WorldSuggestions` and shape/pattern suggestions do.
+struct Words(fn() -> Vec<String>);
+
+impl CommandArgumentType for Words {
+    fn kind(&self) -> CommandArgumentKind {
+        CommandArgumentKind::Word
+    }
+
+    fn parse(&self, input: &str) -> Result<String, CommandArgumentError> {
+        Ok(input.to_owned())
+    }
+
+    fn suggest(&self, _: Option<&CommandSender>, prefix: &str) -> Vec<CommandSuggestion> {
+        let prefix = prefix.to_ascii_lowercase();
+        (self.0)()
+            .into_iter()
+            .filter(|w| w.to_ascii_lowercase().starts_with(&prefix))
+            .map(CommandSuggestion::new)
+            .collect()
+    }
+}
+
+/// The worlds tab completion offers: the three and the custom dimensions seen so far.
+fn world_words() -> Vec<String> {
+    available_worlds()
+}
+
+/// The trim filter words after the side: a greedy text that completes the filter keys not used yet (`inhabited=`,
+/// `unmodified=`), as Chunky's `TrimFilters.suggestions` does. A bare first word counts as `inhabited`.
+struct Filters;
+
+impl CommandArgumentType for Filters {
+    fn kind(&self) -> CommandArgumentKind {
+        CommandArgumentKind::Greedy
+    }
+
+    fn parse(&self, input: &str) -> Result<String, CommandArgumentError> {
+        Ok(input.to_owned())
+    }
+
+    fn suggest(&self, _: Option<&CommandSender>, prefix: &str) -> Vec<CommandSuggestion> {
+        chunky::engine::trim_filter_suggestions(prefix)
+            .into_iter()
+            .map(|(text, start)| CommandSuggestion::new(text).replacing_from(start))
+            .collect()
+    }
+}
+
+fn shape_words() -> Vec<String> {
+    SHAPES.iter().map(|s| (*s).to_owned()).collect()
+}
+
+fn side_words() -> Vec<String> {
+    vec!["outside".to_owned(), "inside".to_owned()]
+}
+
+/// `max-world-size` from server.properties, Minecraft's default when it is not there.
+fn max_world_size() -> f64 {
+    std::fs::read_to_string("server.properties")
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .find_map(|l| l.strip_prefix("max-world-size="))
+                .and_then(|v| v.trim().parse::<f64>().ok())
+        })
+        .unwrap_or(29_999_984.0)
+}
+
 /// Holds (`forced`) or releases one chunk of `level` through the mod's controller.
 fn force(
     host: &mut dyn ServerHost,
@@ -206,22 +420,45 @@ impl Hooks for Mod {
         let _ = self
             .controller
             .set(r.register_ticket_controller("tasks", false));
+        r.register_command_argument("world", Words(world_words));
+        r.register_command_argument("shape", Words(shape_words));
+        r.register_command_argument("side", Words(side_words));
+        r.register_command_argument("filters", Filters);
+    }
+
+    fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
+        // The root node and one per subcommand, each defaulting to operator level 2 (`LEVEL`).
+        let level = PermissionLevel::from_level(i32::from(LEVEL));
+        let names = std::iter::once(ROOT_NODE.to_string()).chain(SUBS.iter().map(|s| format!("chunky.command.{s}")));
+        for name in names {
+            let _ = event.nodes.add(typed(&name), NodeDefault::Level(level));
+        }
     }
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
+        for usage in usages() {
+            let sub = usage.split(' ').nth(1).filter(|w| !w.starts_with('<') && !w.starts_with('['));
+            if sub.and_then(permission_node).is_some() {
+                continue;
+            }
+            for label in ["chunky", "cy"] {
+                event.commands.push(Command::op(&usage.replacen("chunky", label, 1), 2));
+            }
+        }
+    }
+
+    fn register_node_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterNodeCommandsEvent<'_>) {
         // Each subcommand path carries Chunky's node (`chunky.command.start`), as Brigadier's requires on that
         // literal: a permissions mod can hand one subcommand to a non-operator; level 2 decides when none answers.
         // The bare `/chunky` (help) has no node, so it does not gate the subcommands.
         for usage in usages() {
             let sub = usage.split(' ').nth(1).filter(|w| !w.starts_with('<') && !w.starts_with('['));
-            let node = sub.and_then(permission_node);
+            let Some(node) = sub.and_then(permission_node) else {
+                continue;
+            };
             // plugin.yml gives Chunky the alias `cy`: the same usages under that label.
             for label in ["chunky", "cy"] {
-                let command = Command::op(&usage.replacen("chunky", label, 1), 2);
-                event.commands.push(match &node {
-                    Some(node) => command.with_node(node),
-                    None => command,
-                });
+                event.commands.push(Command::op(&usage.replacen("chunky", label, 1), 2).with_node(&typed(&node)));
             }
         }
     }
@@ -229,19 +466,23 @@ impl Hooks for Mod {
     /// Tab completion: a player with no chunky node at all (and below the operator level) is not offered
     /// `chunky` or `cy` (Bukkit hides a command the sender may not run).
     fn player_commands_sent(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandsSentEvent<'_>) {
-        let h: &dyn ServerHost = &*host;
-        let may = h.player(event.player).is_some_and(|p| {
-            p.permission_level(h).unwrap_or(0) >= LEVEL
-                || p.permission_value(h, ROOT_NODE) == Some(true)
-                || SUBS.iter().any(|s| p.permission_value(h, &format!("chunky.command.{s}")) == Some(true))
-        });
+        let may = match host.player(event.player) {
+            Some(p) => {
+                p.permission_level(&*host).unwrap_or(0) >= LEVEL
+                    || p.permission_bool(host, &typed(ROOT_NODE)).unwrap_or(false)
+                    || SUBS.iter().any(|s| {
+                        p.permission_bool(host, &typed(&format!("chunky.command.{s}"))).unwrap_or(false)
+                    })
+            }
+            None => false,
+        };
         if !may {
             event.names.retain(|n| !matches!(n.to_ascii_lowercase().as_str(), "chunky" | "cy"));
         }
     }
 
-    /// A player without the node gets Bukkit's permission message, as the original. The tree already leaves those
-    /// usages out for them (`with_node`); this line answers what the tree no longer shows.
+    /// A player without the node is answered as for an unknown command (Chunky's Brigadier tree hides it). The tree
+    /// already leaves those usages out for them (`with_node`); this line answers what the tree no longer shows.
     fn player_command(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandEvent<'_>) -> Flow {
         let mut words = event.command.split_whitespace();
         let root = words.next().unwrap_or("").to_ascii_lowercase();
@@ -253,11 +494,11 @@ impl Hooks for Mod {
             .next()
             .and_then(permission_node)
             .unwrap_or_else(|| ROOT_NODE.to_string());
-        let h: &dyn ServerHost = &*host;
-        let allowed = h.player(event.player).is_some_and(|p| {
-            let level = p.permission_level(h).unwrap_or(0);
-            p.permission_value(h, &node).unwrap_or(level >= LEVEL)
-        });
+        // Any refused query is a denial; the node's default (operator level 2) is what an operator gets.
+        let allowed = match host.player(event.player) {
+            Some(p) => p.permission_bool(host, &typed(&node)).unwrap_or(false),
+            None => false,
+        };
         if allowed {
             return Flow::Continue;
         }
@@ -286,11 +527,16 @@ impl Hooks for Mod {
                     .filter_map(|a| match &a.value {
                         CommandArgumentValue::String(s) => Some(s.clone()),
                         CommandArgumentValue::Integer(i) => Some(i.to_string()),
+                        CommandArgumentValue::Custom { value, .. } => Some(value.clone()),
                         _ => None,
                     }),
             )
             .collect::<Vec<_>>()
             .join(" ");
+        let sender = match &event.source {
+            CommandSource::Player { player, .. } => player.name(&*host).unwrap_or_default(),
+            _ => String::new(),
+        };
         let at = match &event.source {
             CommandSource::Player { player, .. } => {
                 let entity = player.entity();
@@ -307,18 +553,27 @@ impl Hooks for Mod {
             }
             _ => None,
         };
+        // `chunky spawn` centres on the selected world's own spawn.
+        let selected = chunky::with(|e| e.selected_world().to_owned());
         let spawn = host
-            .level("minecraft:overworld")
+            .level(dimension_of(&selected))
             .and_then(|l| l.respawn_data(&*host))
             .map(|r| [f64::from(r.pos[0]), f64::from(r.pos[2])]);
-        let who = Who { at, spawn };
+        let who = Who { at, spawn, sender };
         let world_dir = lock(&self.world_dir).clone();
-        let lines = chunky::with(|e| {
+        let mut lines = chunky::with(|e| {
             e.set_world_dir(world_dir);
             e.command(&line, &who, chunky::now_ms())
         });
+        // `chunky worldborder` answers the sender with what it read (Chunky's `WorldBorderCommand`).
+        if let Some(world) = chunky::with(|e| e.take_border_world()) {
+            lines.extend(self.border_lines(host, &world));
+        }
+        for l in chunky::with(|e| e.take_console()) {
+            log(&l);
+        }
         for l in lines {
-            let _ = host.commands().feedback(Text::literal(l));
+            let _ = host.commands().feedback(legacy_text(&l));
         }
         Flow::Cancel
     }
@@ -339,6 +594,9 @@ impl Hooks for Mod {
         for l in chunky::init_once(config, Some(world_dir)) {
             log(&l);
         }
+        if disable_pause_when_empty() {
+            log(&chunky::lang::tr("error_pause_when_empty_seconds", &[]));
+        }
     }
 
     fn server_stopping(&self, _: &mut dyn ServerHost, _: &mut ServerStoppingEvent) {
@@ -354,9 +612,15 @@ impl Hooks for Mod {
         };
         let level = event.level;
         let dim = level.dimension_id();
+        register_dimension(dim);
         self.sweep_once(host, level, dim, controller);
-        if chunky::with(|e| e.take_border_request(dim)) {
-            self.border(&*host, level, dim);
+        // Lines a background job (`debug map`) finished with, for whoever asked.
+        for (sender, line) in chunky::with(|e| e.take_async()) {
+            if sender.is_empty() {
+                log(&line);
+            } else {
+                tell_named(host, &sender, &line);
+            }
         }
         if !chunky::with(|e| e.any_running_in(dim)) {
             // Nothing runs here: the engine forgets the chunks it was told of, so the next run starts from the truth.
@@ -380,6 +644,12 @@ impl Hooks for Mod {
         }
         for l in &actions.log {
             log(l);
+        }
+        for (owner, line) in &actions.notify {
+            tell_named(host, owner, line);
+        }
+        for l in chunky::with(|e| e.take_console()) {
+            log(&l);
         }
     }
 
@@ -444,14 +714,37 @@ impl Mod {
         seen.insert(dim.to_owned(), now);
     }
 
-    /// The border's centre and size go to the engine's selection (`chunky worldborder`), as the Horizon port did.
-    fn border(&self, host: &dyn ServerHost, level: LevelRef, dim: &str) {
-        let Some([x0, z0, x1, z1]) = level.world_border(host) else {
-            log(&format!("no world border to read in {dim}"));
-            return;
+    /// The selected world's border becomes the selection's centre and radius; the answer is Chunky's lines.
+    fn border_lines(&self, host: &mut dyn ServerHost, world: &str) -> Vec<String> {
+        let border = host
+            .level(dimension_of(world))
+            .and_then(|level| level.world_border(&*host));
+        let Some([x0, z0, x1, z1]) = border else {
+            return vec![format!(
+                "[Chunky] No world border to read in {}.",
+                display_world(world)
+            )];
         };
         let centre = [(x0 + x1) / 2.0, (z0 + z1) / 2.0];
-        let line = chunky::with(|e| e.set_border(centre, x1 - x0));
-        log(&line);
+        chunky::with(|e| e.set_border(centre, x1 - x0, max_world_size()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colour_codes_split_a_message_into_styled_runs() {
+        let segs = legacy_segments("&2chunky start&r - Start a task");
+        assert_eq!(segs.len(), 2);
+        assert_eq!((segs[0].text.as_str(), segs[0].color), ("chunky start", Some("#00AA00")));
+        assert_eq!((segs[1].text.as_str(), segs[1].color), (" - Start a task", None));
+        let warn = legacy_segments("[Chunky] &cWarning: a & b &z");
+        assert_eq!(warn[0].text, "[Chunky] ");
+        assert_eq!((warn[1].text.as_str(), warn[1].color), ("Warning: a & b &z", Some("#FF5555")));
+        assert_eq!(strip_legacy("&aChunky Commands&r"), "Chunky Commands");
+        let bold = legacy_segments("&c&lHi");
+        assert!(bold[0].bold && bold[0].color == Some("#FF5555"));
     }
 }
