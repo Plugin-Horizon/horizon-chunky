@@ -28,8 +28,9 @@ chunky world [world]        chunky shape <shape>           chunky pattern <patte
 chunky center [x z]         chunky spawn                   chunky corners <x1> <z1> <x2> <z2>
 chunky radius <r> [z r]     (+/-: relative, 10k, 625c, 2r)  chunky worldborder [world]
 chunky silent               chunky quiet <seconds>         chunky reload [config|tasks]
-chunky trim [world] [shape] [x z] [radius] [z radius] [outside|inside] [inhabited ticks]
+chunky trim [world] [shape] [x z] [radius] [z radius] [outside|inside] [inhabited=a..b] [unmodified=2d]
 chunky trim abort           chunky confirm                 chunky help [page]
+chunky limit <rate>         chunky debug map
 ```
 
 `start` and `trim` take the words in that order: a shape needs a world before it, the centre two numbers, the radii
@@ -38,8 +39,8 @@ one or two; the side word of `trim` comes after both radii. `cancel`, `start` ov
 
 `limit <rate>` caps a task at that many chunks per second (0 for none; saved with the task). A player who starts or continues a task is told when it finishes, and `confirm` is kept per sender. Tab completion offers world, shape, pattern and trim-side words.
 
-Not ported: `debug map`, the `border` subcommands (ChunkyBorder is not on Horizon), the trim filter
-`unmodified` and inhabited ranges. See the Known gaps section.
+`debug map` writes `config/chunky/debug/<world>.png`. Trim filters: `inhabited=<min>..<max>` and `unmodified=<amount><unit>`.
+Not ported: the `border` subcommands (ChunkyBorder is not on Horizon). See the Known gaps section.
 
 ## Shapes and patterns
 
@@ -89,7 +90,7 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
 
-- Messages are plain text: Chunky's colour codes (help, trim warning, notices) are left out.
-- `start` has no radius-limit check and no disk-space warning; `chunky debug map`, the `border` subcommands, the trim filter `unmodified` and inhabited ranges are not ported; trim runs at the next server start, not live.
+- `start` checks `radius-limit` from `config/chunky/.chunky.properties`; Chunky's disk-space message is not ported (the original never prints it).
+- The `border` subcommands (the ChunkyBorder add-on) are not ported; trim runs at the next server start, not live.
 - Only the Overworld, Nether and End are known worlds; a custom dimension cannot be pre-generated.
-- A player without a node gets Bukkit's permission line (the original hides the command on Paper's Brigadier build).
+- No `language` key and no translations; trim filters are not tab-completed.

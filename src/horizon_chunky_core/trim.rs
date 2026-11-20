@@ -26,8 +26,14 @@ pub struct TrimJob {
     pub sel: Selection,
     /// Delete inside the selection instead of outside it.
     pub inside: bool,
-    /// Only chunks whose `InhabitedTime` is at most this many ticks go (chunks whose time can't be read stay).
+    /// Only chunks whose `InhabitedTime` is between `inhabited_min` and this many ticks go (chunks whose time can't be
+    /// read stay).
     pub inhabited: Option<i64>,
+    /// The lower end of the `inhabited` range (`inhabited=<min>..<max>`), 0 without one.
+    pub inhabited_min: i64,
+    /// Only chunks last saved at or before this Unix time (seconds) go; a chunk with no timestamp stays
+    /// (`unmodified=<amount><unit>`).
+    pub unmodified: Option<i64>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -44,18 +50,34 @@ impl TrimJob {
         self.sel.contains(c) == self.inside
     }
 
-    /// Delete flags for the chunks of region `r`, from the terrain file (`region/`): targeted, and inhabited little
-    /// enough when the job asks. A chunk with no terrain record goes when it is targeted.
+    /// Delete flags for the chunks of region `r`, from the terrain file (`region/`): targeted, inhabited within the
+    /// range and not saved since the cutoff, when the job asks. A chunk with no terrain record goes when it is
+    /// targeted (Chunky's `UnmodifiedFilter` lets a chunk that does not exist pass too).
     fn decide(&self, r: (i32, i32)) -> Vec<bool> {
         let mut del: Vec<bool> = (0..1024).map(|i| self.targeted(region::chunk_at(r, i))).collect();
-        let Some(limit) = self.inhabited else { return del };
+        if self.inhabited.is_none() && self.unmodified.is_none() {
+            return del;
+        }
         let path = region::region_path(&self.dir, "region", r);
         let Ok(mut f) = std::fs::File::open(&path) else { return del };
         let Ok(loc) = region::read_locations(&mut f) else { return vec![false; 1024] };
+        let stamps = if self.unmodified.is_some() { region::read_timestamps(&mut f).ok() } else { None };
         for i in 0..1024 {
-            if del[i] && loc[i] != 0 {
+            if !del[i] || loc[i] == 0 {
+                continue;
+            }
+            if let Some(max) = self.inhabited {
                 let time = region::read_record(&mut f, loc[i]).and_then(|n| region::nbt_long(&n, "InhabitedTime"));
-                del[i] = time.is_some_and(|t| t <= limit);
+                if !time.is_some_and(|t| t >= self.inhabited_min && t <= max) {
+                    del[i] = false;
+                    continue;
+                }
+            }
+            if let Some(cutoff) = self.unmodified {
+                let at = stamps.as_ref().map_or(0, |s| i64::from(s[i]));
+                if at == 0 || at > cutoff {
+                    del[i] = false;
+                }
             }
         }
         del
@@ -154,7 +176,8 @@ fn trim_file(path: &Path, r: (i32, i32), del: &[bool]) -> std::io::Result<(u64, 
 pub fn render(job: &TrimJob) -> String {
     format!(
         "# A confirmed chunky trim, applied when the server next starts. Delete this file to call it off.\n\
-         world={}\ndimension-dir={}\ncenter-x={:?}\ncenter-z={:?}\nradius={:?}\nradius-z={:?}\nshape={}\ninside={}\ninhabited={}\n",
+         world={}\ndimension-dir={}\ncenter-x={:?}\ncenter-z={:?}\nradius={:?}\nradius-z={:?}\nshape={}\ninside={}\ninhabited={}\n\
+         inhabited-min={}\nunmodified-cutoff={}\n",
         job.world,
         job.dir.display(),
         job.sel.cx,
@@ -164,6 +187,8 @@ pub fn render(job: &TrimJob) -> String {
         job.sel.shape.name(),
         job.inside,
         job.inhabited.map_or(-1, |v| v),
+        job.inhabited_min,
+        job.unmodified.map_or(-1, |v| v),
     )
 }
 
@@ -187,6 +212,9 @@ pub fn parse(text: &str) -> Result<TrimJob, String> {
         return Err("bad radius".into());
     }
     let inhabited: i64 = get("inhabited")?.parse().map_err(|_| "bad inhabited")?;
+    // Written by newer versions only; a job file from an older one has neither.
+    let inhabited_min: i64 = m.get("inhabited-min").map_or(Ok(0), |v| v.parse()).map_err(|_| "bad inhabited-min")?;
+    let unmodified: i64 = m.get("unmodified-cutoff").map_or(Ok(-1), |v| v.parse()).map_err(|_| "bad unmodified-cutoff")?;
     Ok(TrimJob {
         world: get("world")?.to_owned(),
         dir,
@@ -200,6 +228,8 @@ pub fn parse(text: &str) -> Result<TrimJob, String> {
         },
         inside: get("inside")? == "true",
         inhabited: (inhabited >= 0).then_some(inhabited),
+        inhabited_min,
+        unmodified: (unmodified >= 0).then_some(unmodified),
     })
 }
 
@@ -250,6 +280,8 @@ mod tests {
 
     fn job(dir: PathBuf, inside: bool, inhabited: Option<i64>) -> TrimJob {
         TrimJob {
+            inhabited_min: 0,
+            unmodified: None,
             world: "world".into(),
             dir,
             sel: Selection { shape: Shape::Square, pattern: Pattern::Region, cx: 0.0, cz: 0.0, radius: 32.0, radius_z: 32.0 },
@@ -301,6 +333,27 @@ mod tests {
         assert_eq!(rep.chunks_deleted, 1);
         let left = region::existing_in(&region::region_path(&d, "region", (0, 0)), (0, 0)).unwrap();
         assert_eq!(left, vec![(1, 0), (5, 5)]);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn inhabited_range_and_unmodified_cutoff() {
+        let d = tmp("filters");
+        world(&d);
+        // Inside the 4x4 chunk square: (0,0) inhabited 10, (1,0) inhabited 5000. Range 20..6000 keeps (0,0), deletes (1,0).
+        let mut j = job(d.clone(), true, Some(6000));
+        j.inhabited_min = 20;
+        assert_eq!(j.apply().chunks_deleted, 1);
+        let left = region::existing_in(&region::region_path(&d, "region", (0, 0)), (0, 0)).unwrap();
+        assert_eq!(left, vec![(0, 0), (5, 5)]);
+        // Every saved chunk carries the timestamp 1234: a cutoff before it keeps them, one after it deletes them.
+        let mut j = job(d.clone(), true, None);
+        j.unmodified = Some(1000);
+        assert_eq!(j.apply().chunks_deleted, 0);
+        j.unmodified = Some(2000);
+        assert_eq!(j.apply().chunks_deleted, 1);
+        let parsed = parse(&render(&j)).unwrap();
+        assert_eq!((parsed.inhabited_min, parsed.unmodified), (0, Some(2000)));
         let _ = std::fs::remove_dir_all(d);
     }
 

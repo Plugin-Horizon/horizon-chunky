@@ -2,6 +2,7 @@
 //! The mod's helpers feed it commands, ticks and chunk loads and apply the chunk tickets it asks for.
 
 pub mod engine;
+pub mod genmap;
 pub mod geom;
 pub mod region;
 pub mod task;

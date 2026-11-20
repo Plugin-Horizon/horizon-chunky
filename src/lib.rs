@@ -36,14 +36,111 @@ const OWNER: TicketOwner = TicketOwner::Block([0, 0, 0]);
 /// plugin.yml: `chunky.command` (the root, default op) and the operator level the usages are registered at.
 const ROOT_NODE: &str = "chunky.command";
 const LEVEL: u8 = 2;
-/// Bukkit's permission message, which plugin.yml gives every permission-gated command (no `permission-message`).
-const NO_PERMISSION: &str = "I'm sorry, but you do not have permission to perform this command. Please contact the server administrators if you believe that this is in error.";
 
-/// The red permission message for a player without the node.
+/// Brigadier's answer for a literal the sender may not use. Chunky's Paper build puts its permission on the command
+/// tree, so a player without the node never sees the command (the plain-Bukkit fallback would print a permission message).
+const UNKNOWN_COMMAND: &str = "Unknown or incomplete command, see below for error";
+
+/// The answer for a player without the node: the command is hidden, as Chunky's Brigadier tree hides it.
 fn no_permission() -> Text {
     let mut style = TextStyle::default();
     style.color = Some("#FF5555".to_string());
-    Text::literal(NO_PERMISSION).with_style(style)
+    Text::literal(UNKNOWN_COMMAND).with_style(style)
+}
+
+/// One run of a message with one formatting, from Chunky's `&` colour codes.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Segment {
+    text: String,
+    color: Option<&'static str>,
+    bold: bool,
+    italic: bool,
+    underlined: bool,
+    strikethrough: bool,
+    obfuscated: bool,
+}
+
+/// What `&<code>` gives (Bukkit's `ChatColor`): `0`-`9`, `a`-`f` are colours.
+fn legacy_color(c: char) -> Option<&'static str> {
+    Some(match c.to_ascii_lowercase() {
+        '0' => "#000000",
+        '1' => "#0000AA",
+        '2' => "#00AA00",
+        '3' => "#00AAAA",
+        '4' => "#AA0000",
+        '5' => "#AA00AA",
+        '6' => "#FFAA00",
+        '7' => "#AAAAAA",
+        '8' => "#555555",
+        '9' => "#5555FF",
+        'a' => "#55FF55",
+        'b' => "#55FFFF",
+        'c' => "#FF5555",
+        'd' => "#FF55FF",
+        'e' => "#FFFF55",
+        'f' => "#FFFFFF",
+        _ => return None,
+    })
+}
+
+/// Splits a message at its `&` codes (`translateAlternateColorCodes('&', ...)`): a colour code sets the colour and
+/// clears the formats, `&r` resets, `&k &l &m &n &o` add a format. An `&` before anything else stays as typed.
+fn legacy_segments(line: &str) -> Vec<Segment> {
+    let mut out = Vec::new();
+    let mut cur = Segment::default();
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        let code = if c == '&' { chars.peek().copied() } else { None };
+        let Some(code) = code else {
+            cur.text.push(c);
+            continue;
+        };
+        let lower = code.to_ascii_lowercase();
+        let known = legacy_color(code).is_some() || matches!(lower, 'r' | 'k' | 'l' | 'm' | 'n' | 'o');
+        if !known {
+            cur.text.push(c);
+            continue;
+        }
+        chars.next();
+        if !cur.text.is_empty() {
+            out.push(cur.clone());
+        }
+        cur.text.clear();
+        match (legacy_color(code), lower) {
+            (Some(color), _) => cur = Segment { color: Some(color), ..Segment::default() },
+            (None, 'r') => cur = Segment::default(),
+            (None, 'k') => cur.obfuscated = true,
+            (None, 'l') => cur.bold = true,
+            (None, 'm') => cur.strikethrough = true,
+            (None, 'n') => cur.underlined = true,
+            _ => cur.italic = true,
+        }
+    }
+    if !cur.text.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// A message with Chunky's `&` colour codes as Horizon text.
+fn legacy_text(line: &str) -> Text {
+    let mut text = Text::literal("");
+    for seg in legacy_segments(line) {
+        let mut style = TextStyle::default();
+        style.color = seg.color.map(str::to_owned);
+        style.bold = seg.bold.then_some(true);
+        style.italic = seg.italic.then_some(true);
+        style.underlined = seg.underlined.then_some(true);
+        style.strikethrough = seg.strikethrough.then_some(true);
+        style.obfuscated = seg.obfuscated.then_some(true);
+        text = text.append(Text::literal(seg.text).with_style(style));
+    }
+    text
+}
+
+/// A message without its colour codes, for the console log.
+fn strip_legacy(line: &str) -> String {
+    legacy_segments(line).into_iter().map(|s| s.text).collect()
 }
 
 #[derive(Default)]
@@ -59,7 +156,7 @@ struct Mod {
 }
 
 fn log(line: &str) {
-    eprintln!("[chunky] {line}");
+    eprintln!("[chunky] {}", strip_legacy(line));
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -71,7 +168,7 @@ fn tell_named(host: &mut dyn ServerHost, name: &str, line: &str) {
     let players = host.players().server_players();
     for player in players {
         if player.name(&*host).is_some_and(|n| n.eq_ignore_ascii_case(name)) {
-            let _ = player.tell(host, Text::literal(line.to_owned()));
+            let _ = player.tell(host, legacy_text(line));
         }
     }
 }
@@ -324,8 +421,8 @@ impl Hooks for Mod {
         }
     }
 
-    /// A player without the node gets Bukkit's permission message, as the original. The tree already leaves those
-    /// usages out for them (`with_node`); this line answers what the tree no longer shows.
+    /// A player without the node is answered as for an unknown command (Chunky's Brigadier tree hides it). The tree
+    /// already leaves those usages out for them (`with_node`); this line answers what the tree no longer shows.
     fn player_command(&self, host: &mut dyn ServerHost, event: &mut PlayerCommandEvent<'_>) -> Flow {
         let mut words = event.command.split_whitespace();
         let root = words.next().unwrap_or("").to_ascii_lowercase();
@@ -416,7 +513,7 @@ impl Hooks for Mod {
             log(&l);
         }
         for l in lines {
-            let _ = host.commands().feedback(Text::literal(l));
+            let _ = host.commands().feedback(legacy_text(&l));
         }
         Flow::Cancel
     }
@@ -453,6 +550,14 @@ impl Hooks for Mod {
         let level = event.level;
         let dim = level.dimension_id();
         self.sweep_once(host, level, dim, controller);
+        // Lines a background job (`debug map`) finished with, for whoever asked.
+        for (sender, line) in chunky::with(|e| e.take_async()) {
+            if sender.is_empty() {
+                log(&line);
+            } else {
+                tell_named(host, &sender, &line);
+            }
+        }
         if !chunky::with(|e| e.any_running_in(dim)) {
             // Nothing runs here: the engine forgets the chunks it was told of, so the next run starts from the truth.
             if let Some(prev) = lock(&self.seen).remove(dim) {
@@ -558,5 +663,24 @@ impl Mod {
         };
         let centre = [(x0 + x1) / 2.0, (z0 + z1) / 2.0];
         chunky::with(|e| e.set_border(centre, x1 - x0, max_world_size()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn colour_codes_split_a_message_into_styled_runs() {
+        let segs = legacy_segments("&2chunky start&r - Start a task");
+        assert_eq!(segs.len(), 2);
+        assert_eq!((segs[0].text.as_str(), segs[0].color), ("chunky start", Some("#00AA00")));
+        assert_eq!((segs[1].text.as_str(), segs[1].color), (" - Start a task", None));
+        let warn = legacy_segments("[Chunky] &cWarning: a & b &z");
+        assert_eq!(warn[0].text, "[Chunky] ");
+        assert_eq!((warn[1].text.as_str(), warn[1].color), ("Warning: a & b &z", Some("#FF5555")));
+        assert_eq!(strip_legacy("&aChunky Commands&r"), "Chunky Commands");
+        let bold = legacy_segments("&c&lHi");
+        assert!(bold[0].bold && bold[0].color == Some("#FF5555"));
     }
 }

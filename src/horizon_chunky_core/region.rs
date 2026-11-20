@@ -77,6 +77,22 @@ pub fn read_locations(file: &mut std::fs::File) -> std::io::Result<[u32; 1024]> 
     Ok(out)
 }
 
+/// The timestamp table of a region file (seconds, 0 for a chunk that was never saved); a file shorter than its header
+/// has none.
+pub fn read_timestamps(file: &mut std::fs::File) -> std::io::Result<[u32; 1024]> {
+    let mut head = vec![0u8; 4096];
+    let mut out = [0u32; 1024];
+    if file.metadata()?.len() < 8192 {
+        return Ok(out);
+    }
+    file.seek(SeekFrom::Start(4096))?;
+    file.read_exact(&mut head)?;
+    for (i, o) in out.iter_mut().enumerate() {
+        *o = u32::from_be_bytes([head[i * 4], head[i * 4 + 1], head[i * 4 + 2], head[i * 4 + 3]]);
+    }
+    Ok(out)
+}
+
 /// The chunk at header index `i` of region `r`.
 pub fn chunk_at(r: (i32, i32), i: usize) -> Chunk {
     (r.0 * 32 + (i % 32) as i32, r.1 * 32 + (i / 32) as i32)
@@ -144,6 +160,17 @@ pub fn nbt_string(nbt: &[u8], name: &str) -> Option<String> {
 pub fn nbt_long(nbt: &[u8], name: &str) -> Option<i64> {
     let b = find_tag(nbt, 4, name)?.get(..8)?;
     Some(i64::from_be_bytes(b.try_into().ok()?))
+}
+
+/// The first named int tag `name` (`xPos`, `zPos`).
+pub fn nbt_int(nbt: &[u8], name: &str) -> Option<i32> {
+    let b = find_tag(nbt, 3, name)?.get(..4)?;
+    Some(i32::from_be_bytes(b.try_into().ok()?))
+}
+
+/// Does the NBT hold a tag `name` of type `kind` (1 byte, 3 int, 4 long, 8 string)?
+pub fn nbt_has(nbt: &[u8], kind: u8, name: &str) -> bool {
+    find_tag(nbt, kind, name).is_some()
 }
 
 /// Is the chunk's record fully generated (`Status` `minecraft:full`)? None when it can't be told.
