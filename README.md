@@ -1,5 +1,9 @@
 # horizon-chunky
 
+## Port status
+
+Compared with Chunky b8431a9 (pop4959): **98 %** of the original's commands, permissions, config keys, messages and features work today; **98 %** once our open Horizon PRs are merged; **98 %** with the engine changes we are writing; **98 %** with the newest Horizon SDK. Counted on 59/60 items (see HMOD_PORT.md). Status: not yet compiled after the 2026-11-20 round.
+
 > **Unofficial Rust port of Chunky for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the Chunky authors.**
 
 Derived from Chunky (https://github.com/pop4959/Chunky, GPL-3.0). Copyright of the original: pop4959 and the Chunky
