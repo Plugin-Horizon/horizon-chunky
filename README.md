@@ -37,7 +37,7 @@ chunky limit <rate>         chunky debug map
 one or two; the side word of `trim` comes after both radii. `cancel`, `start` over a saved task and `trim` ask for
 `chunky confirm` within 60 seconds.
 
-`limit <rate>` caps a task at that many chunks per second (0 for none; saved with the task). A player who starts or continues a task is told when it finishes, and `confirm` is kept per sender. Tab completion offers world, shape, pattern and trim-side words.
+`limit <rate>` caps a task at that many chunks per second (0 for none; saved with the task). A player who starts or continues a task is told when it finishes, and `confirm` is kept per sender. Tab completion offers world (custom dimensions too), shape, pattern, trim-side and trim-filter words.
 
 `debug map` writes `config/chunky/debug/<world>.png`. Trim filters: `inhabited=<min>..<max>` and `unmodified=<amount><unit>`.
 Not ported: the `border` subcommands (ChunkyBorder is not on Horizon). See the Known gaps section.
@@ -61,10 +61,13 @@ continue-on-restart = false         # saved, unfinished tasks run again at start
 force-load-existing-chunks = false  # load chunks the save has fully generated instead of skipping them
 update-interval = 1                 # seconds between progress lines (Chunky's `update-interval`, `quiet`)
 silent = false
+language = "en"                   # message file: any of the 28 in lang/ (de, fr, ja, zh_CN...); unknown: en
 max-in-flight = 128                 # this port: chunks held at once per task (32 -> 180 cps, 128 -> 260+ at radius 1000)
 tick-budget-ms = 50                 # this port: stop requesting while a level tick takes longer
 chunk-timeout-ticks = 400           # this port: give up on a chunk that never loads
 ```
+
+Chunky's Bukkit build sets `pause-when-empty-seconds` to 0 in server.properties at enable (and logs that a restart is needed); this port does the same at server start.
 
 Tasks are saved to `config/chunky/tasks/<world>.properties` with Chunky's keys (`world`, `cancelled`, `center-x`,
 `center-z`, `radius`, `shape`, `pattern` as `name` or `csv=<name>`, `chunks`, `time`); a rectangle or ellipse also saves
@@ -92,5 +95,4 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 
 - `start` checks `radius-limit` from `config/chunky/.chunky.properties`; Chunky's disk-space message is not ported (the original never prints it).
 - The `border` subcommands (the ChunkyBorder add-on) are not ported; trim runs at the next server start, not live.
-- Only the Overworld, Nether and End are known worlds; a custom dimension cannot be pre-generated.
-- No `language` key and no translations; trim filters are not tab-completed.
+- Messages are translated by matching each printed line against `lang/en.json` (see `src/horizon_chunky_core/lang.rs`); a line whose wording differs from that file is printed in English.

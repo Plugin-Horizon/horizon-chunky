@@ -4,6 +4,7 @@
 pub mod engine;
 pub mod genmap;
 pub mod geom;
+pub mod lang;
 pub mod region;
 pub mod task;
 pub mod trim;
@@ -56,6 +57,7 @@ pub fn init_once(config_dir: &Path, world_dir: Option<std::path::PathBuf>) -> Ve
     }
     let base = config_dir.join("chunky");
     let cfg = std::fs::read_to_string(base.join("config.toml")).map(|t| Config::parse(&t)).unwrap_or_default();
+    lang::set_language(&cfg.language);
     with(|e| {
         e.cfg = cfg;
         e.set_base(base);

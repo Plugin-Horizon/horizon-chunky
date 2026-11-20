@@ -18,6 +18,10 @@ pub const KINDS: [&str; 3] = ["region", "entities", "poi"];
 /// The folder of one dimension inside a world folder: `dimensions/minecraft/<name>` (the layout of 26.x saves); a
 /// world in the older layout (`region/` at the top, `DIM-1/`, `DIM1/`) is used when the new folder is missing.
 pub fn dimension_dir(world_dir: &Path, world: &str) -> PathBuf {
+    // A custom dimension (its id `namespace:path`) lives in `dimensions/<namespace>/<path>`.
+    if let Some((namespace, path)) = world.split_once(':') {
+        return world_dir.join("dimensions").join(namespace).join(path);
+    }
     let (new, old) = match world {
         "world_nether" => ("the_nether", Some("DIM-1")),
         "world_the_end" => ("the_end", Some("DIM1")),

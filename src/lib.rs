@@ -3,8 +3,9 @@
 //!
 //! - Commands: Chunky's tree from `register_commands`, every usage at operator level 2. arismoko hands over the
 //!   parsed invocation, not the typed line, so `run_mod_command` rebuilds the line from its literals and then its
-//!   arguments, and the engine parses that line as before. Shape and side are words, not literals, because the
-//!   rebuilt line cannot place a literal between arguments; tab completion therefore lists no shape names.
+//!   arguments, and the engine parses that line as before. World, shape, side and the trim filters are registered
+//!   argument types (`chunky:world`, `chunky:shape`, `chunky:side`, `chunky:filters`): they accept what the engine
+//!   checks and complete from Chunky's lists, as its suggestion providers do.
 //! - Chunk tickets: a running task holds its chunks through the mod's own ticket controller `chunky:tasks`, from
 //!   `level_tick_pre`. The engine learns about loaded chunks by diffing `level_loaded_chunks` while a task runs
 //!   there, in place of Horizon's `chunk_load` and `chunk_unload` hooks. Tickets a previous run left in the save
@@ -12,11 +13,12 @@
 //! - Border: read when `chunky worldborder` asks for it (`level_world_border`), as before. Nothing is set.
 //! - Config: `config/chunky/config.toml` and the saved tasks are read at server start, the trim is applied before
 //!   any world opens, and the tasks are saved at server stop, as in the Horizon port. No `register_configs`, so no
-//!   default file is written.
+//!   default file is written. `language` picks the message file (`lang/<code>.json`); every line the mod prints goes
+//!   through `lang::localize` on its way out.
 
 pub mod horizon_chunky_core;
 use horizon_chunky_core as chunky;
-use crate::horizon_chunky_core::engine::{Who, canon_world, dimension_of, display_world, set_level_name};
+use crate::horizon_chunky_core::engine::{Who, available_worlds, canon_world, dimension_of, display_world, register_dimension, set_level_name};
 use mod_api::text::TextStyle;
 use mod_api::{
     ChunkRef, Command, CommandArgumentError, CommandArgumentKind, CommandArgumentType,
@@ -125,7 +127,7 @@ fn legacy_segments(line: &str) -> Vec<Segment> {
 /// A message with Chunky's `&` colour codes as Horizon text.
 fn legacy_text(line: &str) -> Text {
     let mut text = Text::literal("");
-    for seg in legacy_segments(line) {
+    for seg in legacy_segments(&chunky::lang::localize(line)) {
         let mut style = TextStyle::default();
         style.color = seg.color.map(str::to_owned);
         style.bold = seg.bold.then_some(true);
@@ -156,7 +158,7 @@ struct Mod {
 }
 
 fn log(line: &str) {
-    eprintln!("[chunky] {}", strip_legacy(line));
+    eprintln!("[chunky] {}", strip_legacy(&chunky::lang::localize(line)));
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -171,6 +173,31 @@ fn tell_named(host: &mut dyn ServerHost, name: &str, line: &str) {
             let _ = player.tell(host, legacy_text(line));
         }
     }
+}
+
+/// Chunky's Bukkit build sets `pause-when-empty-seconds` to 0 in server.properties (a paused server stops the tasks)
+/// and asks for a restart. True when the file was changed; only that one line is rewritten.
+fn disable_pause_when_empty() -> bool {
+    let Ok(text) = std::fs::read_to_string("server.properties") else { return false };
+    let mut changed = false;
+    let mut out = String::new();
+    for line in text.lines() {
+        let is_setting = line.split_once('=').is_some_and(|(k, v)| {
+            k.trim() == "pause-when-empty-seconds" && v.trim().parse::<i64>().is_ok_and(|n| n > 0)
+        });
+        if is_setting {
+            out.push_str("pause-when-empty-seconds=0\n");
+            changed = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !changed {
+        return false;
+    }
+    let tmp = "server.properties.tmp";
+    std::fs::write(tmp, out).is_ok() && std::fs::rename(tmp, "server.properties").is_ok()
 }
 
 /// `level-name` from server.properties, `world` when it is not there.
@@ -262,7 +289,7 @@ fn usages() -> Vec<String> {
     usages
         .push("chunky trim <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]".into());
     usages.push(
-        "chunky trim <world:chunky:world> <shape:chunky:shape> <x:word> <z:word> <rx:word> <rz:word> <side:chunky:side> [filters:text]".into(),
+        "chunky trim <world:chunky:world> <shape:chunky:shape> <x:word> <z:word> <rx:word> <rz:word> <side:chunky:side> [filters:chunky:filters]".into(),
     );
     usages
 }
@@ -328,8 +355,30 @@ impl CommandArgumentType for Words {
     }
 }
 
+/// The worlds tab completion offers: the three and the custom dimensions seen so far.
 fn world_words() -> Vec<String> {
-    ["world", "world_nether", "world_the_end"].iter().map(|w| display_world(w)).collect()
+    available_worlds()
+}
+
+/// The trim filter words after the side: a greedy text that completes the filter keys not used yet (`inhabited=`,
+/// `unmodified=`), as Chunky's `TrimFilters.suggestions` does. A bare first word counts as `inhabited`.
+struct Filters;
+
+impl CommandArgumentType for Filters {
+    fn kind(&self) -> CommandArgumentKind {
+        CommandArgumentKind::Greedy
+    }
+
+    fn parse(&self, input: &str) -> Result<String, CommandArgumentError> {
+        Ok(input.to_owned())
+    }
+
+    fn suggest(&self, _: Option<&CommandSender>, prefix: &str) -> Vec<CommandSuggestion> {
+        chunky::engine::trim_filter_suggestions(prefix)
+            .into_iter()
+            .map(|(text, start)| CommandSuggestion::new(text).replacing_from(start))
+            .collect()
+    }
 }
 
 fn shape_words() -> Vec<String> {
@@ -374,6 +423,7 @@ impl Hooks for Mod {
         r.register_command_argument("world", Words(world_words));
         r.register_command_argument("shape", Words(shape_words));
         r.register_command_argument("side", Words(side_words));
+        r.register_command_argument("filters", Filters);
     }
 
     fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
@@ -534,6 +584,9 @@ impl Hooks for Mod {
         for l in chunky::init_once(config, Some(world_dir)) {
             log(&l);
         }
+        if disable_pause_when_empty() {
+            log(&chunky::lang::tr("error_pause_when_empty_seconds", &[]));
+        }
     }
 
     fn server_stopping(&self, _: &mut dyn ServerHost, _: &mut ServerStoppingEvent) {
@@ -549,6 +602,7 @@ impl Hooks for Mod {
         };
         let level = event.level;
         let dim = level.dimension_id();
+        register_dimension(dim);
         self.sweep_once(host, level, dim, controller);
         // Lines a background job (`debug map`) finished with, for whoever asked.
         for (sender, line) in chunky::with(|e| e.take_async()) {
