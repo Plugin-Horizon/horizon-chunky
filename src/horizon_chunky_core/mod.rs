@@ -56,7 +56,7 @@ pub fn init_once(config_dir: &Path, world_dir: Option<std::path::PathBuf>) -> Ve
         return Vec::new();
     }
     let base = config_dir.join("chunky");
-    let cfg = std::fs::read_to_string(base.join("config.toml")).map(|t| Config::parse(&t)).unwrap_or_default();
+    let cfg = engine::read_config(&base);
     lang::set_language(&cfg.language);
     with(|e| {
         e.cfg = cfg;

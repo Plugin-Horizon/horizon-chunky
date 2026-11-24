@@ -99,4 +99,6 @@ What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: .
 
 - `start` checks `radius-limit` from `config/chunky/.chunky.properties`; Chunky's disk-space message is not ported (the original never prints it).
 - The `border` subcommands (the ChunkyBorder add-on) are not ported; trim runs at the next server start, not live.
+- Live trim (needs `LevelRef::delete_chunks`) and the aggregate node `chunky.chunky` (needs permission children) wait on engine APIs; see audit/rec100/ENGINE_NEEDS.md.
+- A Java `config.yml` copied into `config/chunky/` is read when `config.toml` is absent (same keys).
 - Messages are translated by matching each printed line against `lang/en.json` (see `src/horizon_chunky_core/lang.rs`); a line whose wording differs from that file is printed in English.

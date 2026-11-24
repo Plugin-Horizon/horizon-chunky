@@ -54,13 +54,21 @@ impl Default for Config {
     }
 }
 
+/// `config.toml`, else the Java server's `config.yml` copied into the same folder.
+pub fn read_config(base: &std::path::Path) -> Config {
+    let text = std::fs::read_to_string(base.join("config.toml")).or_else(|_| std::fs::read_to_string(base.join("config.yml")));
+    text.map(|t| Config::parse(&t)).unwrap_or_default()
+}
+
 impl Config {
-    /// Reads the TOML subset the mod's config uses (`key = value` lines); unknown keys are ignored.
+    /// Reads the TOML subset the mod's config uses (`key = value` lines) or a Chunky `config.yml` (`key: value`);
+    /// unknown keys are ignored.
     pub fn parse(text: &str) -> Config {
         let mut c = Config::default();
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
-            let Some((k, v)) = line.split_once('=') else { continue };
+            // `key = value` (this port's config.toml) or `key: value` (Chunky's config.yml, same keys).
+            let Some((k, v)) = line.split_once('=').or_else(|| line.split_once(':')) else { continue };
             let (k, v) = (k.trim(), v.trim().trim_matches('"'));
             match k {
                 "continue-on-restart" => c.continue_on_restart = v == "true",
@@ -1361,7 +1369,7 @@ impl Engine {
 
     fn reload_config(&mut self) -> Vec<String> {
         let Some(base) = self.base.clone() else { return vec![pre("The config folder is not known yet.")] };
-        self.cfg = std::fs::read_to_string(base.join("config.toml")).map(|t| Config::parse(&t)).unwrap_or_default();
+        self.cfg = read_config(&base);
         crate::horizon_chunky_core::lang::set_language(&self.cfg.language);
         Vec::new()
     }
@@ -1861,6 +1869,12 @@ mod tests {
         let mut e = engine(None);
         e.command("chunky start world square 0 0 100", &Who::default(), 0);
         assert!(e.command("chunky start", &Who::default(), 0)[0].contains("already started"));
+    }
+
+    #[test]
+    fn config_parses_chunky_yml() {
+        let c = Config::parse("# Chunky Configuration\nversion: 2\nlanguage: de\ncontinue-on-restart: true\nforce-load-existing-chunks: true\nsilent: true\nupdate-interval: 5\n");
+        assert!(c.continue_on_restart && c.force_load_existing_chunks && c.silent && c.update_interval == 5 && c.language == "de");
     }
 
     #[test]
