@@ -459,7 +459,12 @@ impl MapOptions {
             }
             let Some((k, v)) = line.split_once('=').or_else(|| line.split_once(':')) else { continue };
             let (k, mut v) = (k.trim(), v.trim());
-            if !v.starts_with('"') && !v.starts_with('\'') {
+            if let Some(q) = v.chars().next().filter(|c| *c == '"' || *c == '\'') {
+                // A quoted value ends at its closing quote; a comment may follow.
+                if let Some(end) = v[1..].find(q) {
+                    v = &v[..end + 2];
+                }
+            } else {
                 v = v.split('#').next().unwrap_or("").trim();
             }
             let v = v.trim_matches('"').trim_matches('\'');
