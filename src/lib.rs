@@ -18,10 +18,14 @@
 
 pub mod horizon_chunky_core;
 use horizon_chunky_core as chunky;
+use crate::horizon_chunky_core::api;
+use crate::horizon_chunky_core::border::{BorderEvent, Redirect, RedirectKind, BYPASS_BREAK, BYPASS_MOVE, BYPASS_PLACE};
 use crate::horizon_chunky_core::engine::{Who, available_worlds, canon_world, dimension_of, display_world, register_dimension, set_level_name};
 use mod_api::text::TextStyle;
 use mod_api::{
-    ChunkRef, Command, CommandArgumentError, CommandArgumentKind, CommandArgumentType,
+    BreakBlockEvent, ChunkRef, Command, EntityRef, EnderPearlTeleportDetailEvent, EntityPlaceEvent, FinalizeSpawnEvent, Heightmap,
+    ItemConsumptionTeleportEvent, ModServiceCallEvent, ModServiceError, ParticleKey, ParticleOptions, PlayerLoggedOutEvent,
+    PlayerRef, PlayerRespawnedEvent, PlayerTeleportEndGatewayDetailEvent, CommandArgumentError, CommandArgumentKind, CommandArgumentType,
     CommandArgumentValue, CommandSender, CommandSource, CommandSuggestion, Flow, Hooks, HostSide, LevelRef,
     LevelTickPostEvent, LevelTickPreEvent, PlayerCommandEvent, RegisterCommandsEvent, RegisterNodeCommandsEvent, Registrar,
     NodeDefault, PermissionGatherNodesEvent, PermissionLevel, PermissionNode, PermissionValueType,
@@ -155,6 +159,12 @@ struct Mod {
     swept: Mutex<HashSet<String>>,
     /// Chunks the engine was told are loaded, per dimension, as the diff's last state.
     seen: Mutex<HashMap<String, HashSet<(i32, i32)>>>,
+    /// Ticks seen per dimension, for the border check's interval (`check-interval`) and the visualizer's phase.
+    border_ticks: Mutex<HashMap<String, u64>>,
+    /// The particle types the border's effect and visualizer use, by short name (`portal`, `dust`), from `register`.
+    particles: Mutex<HashMap<&'static str, ParticleKey>>,
+    /// The tridents a player threw, each with the last position inside the border (`prevent-trident`).
+    tridents: Mutex<Vec<(EntityRef, [f64; 3])>>,
 }
 
 fn log(line: &str) {
@@ -266,6 +276,19 @@ fn usages() -> Vec<String> {
         "chunky reload",
         "chunky reload config",
         "chunky reload tasks",
+        "chunky border",
+        "chunky border help",
+        "chunky border list",
+        "chunky border add",
+        "chunky border add <world:chunky:world>",
+        "chunky border bypass",
+        "chunky border bypass <player:word>",
+        "chunky border load",
+        "chunky border load <world:chunky:world>",
+        "chunky border remove",
+        "chunky border remove <world:chunky:world>",
+        "chunky border wrap",
+        "chunky border wrap <wrap:chunky:wrap>",
         "chunky trim",
         "chunky trim abort",
         "chunky trim <world:chunky:world>",
@@ -286,6 +309,9 @@ fn usages() -> Vec<String> {
     usages.push(
         "chunky start <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]".into(),
     );
+    usages.push(
+        "chunky border add <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]".into(),
+    );
     usages
         .push("chunky trim <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]".into());
     usages.push(
@@ -295,7 +321,8 @@ fn usages() -> Vec<String> {
 }
 
 /// Every subcommand word.
-const SUBS: [&str; 22] = [
+const SUBS: [&str; 23] = [
+    "border",
     "cancel",
     "center",
     "confirm",
@@ -385,6 +412,10 @@ fn shape_words() -> Vec<String> {
     SHAPES.iter().map(|s| (*s).to_owned()).collect()
 }
 
+fn wrap_words() -> Vec<String> {
+    crate::horizon_chunky_core::border::Wrap::ALL.iter().map(|w| w.name().to_owned()).collect()
+}
+
 fn side_words() -> Vec<String> {
     vec!["outside".to_owned(), "inside".to_owned()]
 }
@@ -399,6 +430,25 @@ fn max_world_size() -> f64 {
                 .and_then(|v| v.trim().parse::<f64>().ok())
         })
         .unwrap_or(29_999_984.0)
+}
+
+/// The border key (`world`, `world_nether`, `world_the_end`, a custom dimension's id) and the dimension id of the
+/// level a player is in.
+fn player_world(host: &dyn ServerHost, player: PlayerRef) -> Option<(&'static str, String)> {
+    let dim = player.dimension(host)?.to_string();
+    canon_world(&dim).map(|w| (w, dim))
+}
+
+/// The surface at the column of `at` in `dim` (the first air above the ground), None when it is not loaded.
+fn ground(host: &dyn ServerHost, dim: &str, at: [f64; 3]) -> Option<f64> {
+    let column = (at[0].floor() as i32, at[2].floor() as i32);
+    let heights = host.surface_heights(dim, &[column], Heightmap::WorldSurface).ok()?;
+    heights.first().copied().flatten().map(f64::from)
+}
+
+/// The level's spawn as a position (`World.getSpawn`).
+fn spawn_of(host: &dyn ServerHost, level: LevelRef) -> Option<[f64; 3]> {
+    level.respawn_data(host).map(|r| [f64::from(r.pos[0]) + 0.5, f64::from(r.pos[1]), f64::from(r.pos[2]) + 0.5])
 }
 
 /// Holds (`forced`) or releases one chunk of `level` through the mod's controller.
@@ -424,6 +474,12 @@ impl Hooks for Mod {
         r.register_command_argument("shape", Words(shape_words));
         r.register_command_argument("side", Words(side_words));
         r.register_command_argument("filters", Filters);
+        r.register_command_argument("wrap", Words(wrap_words));
+        // The border's effect and visualizer particles.
+        let mut particles = lock(&self.particles);
+        for name in ["portal", "dust", "smoke", "flame", "effect"] {
+            particles.insert(name, r.particle_key(&format!("minecraft:{name}")));
+        }
     }
 
     fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
@@ -436,10 +492,14 @@ impl Hooks for Mod {
         }
         // `chunky.chunky` (default: nobody) grants the root and every subcommand node but trim (plugin.yml).
         let children: Vec<PermissionNode> = std::iter::once(ROOT_NODE.to_string())
-            .chain(SUBS.iter().filter(|s| **s != "trim").map(|s| format!("chunky.command.{s}")))
+            .chain(SUBS.iter().filter(|s| !matches!(**s, "trim" | "border")).map(|s| format!("chunky.command.{s}")))
             .map(|n| typed(&n))
             .collect();
         let _ = event.nodes.add_with_children(typed("chunky.chunky"), NodeDefault::Nobody, &children);
+        // ChunkyBorder's plugin.yml: bypass nodes nobody has by default.
+        for node in [BYPASS_MOVE, BYPASS_PLACE, BYPASS_BREAK] {
+            let _ = event.nodes.add(typed(node), NodeDefault::Nobody);
+        }
     }
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
@@ -567,6 +627,14 @@ impl Hooks for Mod {
             .and_then(|l| l.respawn_data(&*host))
             .map(|r| [f64::from(r.pos[0]), f64::from(r.pos[2])]);
         let who = Who { at, spawn, sender };
+        // `border bypass <name>` finds the player among those online.
+        let online: Vec<(String, u128)> = host
+            .players()
+            .server_players()
+            .into_iter()
+            .filter_map(|p| Some((p.name(&*host)?, p.uuid())))
+            .collect();
+        chunky::with(|e| e.borders.set_online(&online));
         let world_dir = lock(&self.world_dir).clone();
         let mut lines = chunky::with(|e| {
             e.set_world_dir(world_dir);
@@ -602,7 +670,6 @@ impl Hooks for Mod {
             log(&l);
         }
         // With `delete_chunks` a confirmed trim starts at once instead of at the next start.
-        #[cfg(feature = "next-engine")]
         chunky::with(|e| e.set_live_trim(true));
         if disable_pause_when_empty() {
             log(&chunky::lang::tr("error_pause_when_empty_seconds", &[]));
@@ -624,10 +691,12 @@ impl Hooks for Mod {
         let dim = level.dimension_id();
         register_dimension(dim);
         self.sweep_once(host, level, dim, controller);
-        // A trim that runs while the server is up (`next-engine`): the chunks go a few per tick.
+        // The border: players outside it are sent back, the visualizer draws it, other mods hear what happened.
+        self.border_tick(host, level, dim);
+        self.deliver_events(host);
+        // A trim that runs while the server is up: the chunks go a few per tick.
         if chunky::with(|e| e.live_trim_active(dim)) {
             self.diff_loaded(&*host, level, dim);
-            #[cfg(feature = "next-engine")]
             self.live_trim_step(host, level, dim);
         }
         // Lines a background job (`debug map`) finished with, for whoever asked.
@@ -669,6 +738,101 @@ impl Hooks for Mod {
         }
     }
 
+    /// The services other mods call: `chunky:api` (`horizon_chunky_core::api`).
+    fn mod_service_call(&self, _: &mut dyn ServerHost, event: &mut ModServiceCallEvent<'_>) -> Option<mod_api::PayloadBytes> {
+        if event.service != "chunky:api" {
+            return None;
+        }
+        let text = std::str::from_utf8(&event.payload.0).ok()?;
+        chunky::with(|e| api::handle(e, text)).map(|reply| mod_api::PayloadBytes(reply.into_bytes()))
+    }
+
+    /// ChunkyBorder's `BlockBreakEvent`: no breaking outside the border without `chunkyborder.bypass.break`.
+    fn break_block(&self, host: &mut dyn ServerHost, event: &mut BreakBlockEvent<'_>) -> Flow {
+        let Some(player) = host.players().acting_player() else { return Flow::Continue };
+        self.guard_block(host, player, event.pos, BYPASS_BREAK)
+    }
+
+    /// ChunkyBorder's `BlockPlaceEvent`: no placing outside the border without `chunkyborder.bypass.place`.
+    fn entity_place(&self, host: &mut dyn ServerHost, event: &mut EntityPlaceEvent) -> Flow {
+        let Some(placer) = event.placer else { return Flow::Continue };
+        let Some(player) = host.players().server_players().into_iter().find(|p| p.entity() == placer) else {
+            return Flow::Continue;
+        };
+        let pos = [event.pos.x, event.pos.y, event.pos.z];
+        self.guard_block(host, player, pos, BYPASS_PLACE)
+    }
+
+    /// `prevent-mob-spawns`: nothing spawns outside the border.
+    fn finalize_spawn(&self, _: &dyn mod_api::Host, event: &mut FinalizeSpawnEvent<'_>) -> Flow {
+        if !chunky::with(|e| e.borders.config.prevent_mob_spawns) {
+            return Flow::Continue;
+        }
+        let Some(world) = canon_world(event.dimension) else { return Flow::Continue };
+        if chunky::with(|e| e.borders.spawn_blocked(world, event.pos[0], event.pos[2])) {
+            Flow::Cancel
+        } else {
+            Flow::Continue
+        }
+    }
+
+    /// An ender pearl that lands outside the border: cancelled with `prevent-enderpearl`, else landing inside it.
+    fn ender_pearl_teleport_detail(&self, host: &mut dyn ServerHost, event: &mut EnderPearlTeleportDetailEvent<'_>) -> Flow {
+        let owner = event.owner;
+        let Some(player) = host.players().server_players().into_iter().find(|p| p.entity() == owner) else {
+            return Flow::Continue;
+        };
+        let prevent = chunky::with(|e| e.borders.config.prevent_enderpearl);
+        self.pull_in(host, player, &mut *event.target, prevent, RedirectKind::Teleport)
+    }
+
+    /// Chorus fruit, as the ender pearl (`prevent-chorus-fruit`).
+    fn item_consumption_teleport(&self, host: &mut dyn ServerHost, event: &mut ItemConsumptionTeleportEvent<'_>) -> Flow {
+        let consumer = event.consumer.entity();
+        let Some(player) = host.players().server_players().into_iter().find(|p| p.entity() == consumer) else {
+            return Flow::Continue;
+        };
+        let prevent = chunky::with(|e| e.borders.config.prevent_chorus_fruit);
+        self.pull_in(host, player, &mut *event.target, prevent, RedirectKind::Teleport)
+    }
+
+    /// An end gateway whose exit lies outside the border: cancelled with `prevent-end-gateway`. The exit cannot be
+    /// moved inside (the landing is read-only), so without the option the player lands where the gateway says.
+    fn player_teleport_end_gateway_detail(&self, host: &mut dyn ServerHost, event: &mut PlayerTeleportEndGatewayDetailEvent<'_>) -> Flow {
+        if !chunky::with(|e| e.borders.config.prevent_end_gateway) {
+            return Flow::Continue;
+        }
+        let Some(player) = host.player(event.player) else { return Flow::Continue };
+        let Some((world, _)) = player_world(&*host, player) else { return Flow::Continue };
+        let landing = event.landing;
+        if chunky::with(|e| e.borders.inside(world, landing[0], landing[2])) {
+            return Flow::Continue;
+        }
+        let bypass = player.permission_bool(host, &typed(BYPASS_MOVE)).unwrap_or(false);
+        if bypass || chunky::with(|e| e.borders.is_bypassing(event.player)) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `PlayerRespawnEvent`: a respawn outside the border moves inside it.
+    fn player_respawned(&self, host: &mut dyn ServerHost, event: &mut PlayerRespawnedEvent<'_>) {
+        let Some(player) = host.player(event.player) else { return };
+        let entity = player.entity();
+        let Some(at) = entity.position(&*host) else { return };
+        let mut to = at;
+        let _ = self.pull_in(host, player, &mut to, false, RedirectKind::Respawn);
+        if to != at {
+            let _ = entity.teleport_to(host, to, None);
+        }
+    }
+
+    /// `PlayerQuitEvent`: the player's border data goes.
+    fn player_logged_out(&self, _: &mut dyn ServerHost, event: &mut PlayerLoggedOutEvent<'_>) {
+        chunky::with(|e| e.borders.forget(event.player));
+    }
+
     fn level_tick_post(&self, host: HostSide, _: &mut LevelTickPostEvent) {
         if matches!(host, HostSide::Server(_)) {
             chunky::level_end();
@@ -677,6 +841,235 @@ impl Hooks for Mod {
 }
 
 impl Mod {
+    /// `BlockPlaceEvent` / `BlockBreakEvent` of ChunkyBorder: cancelled when the block lies outside the border and the
+    /// player does not hold the bypass node.
+    fn guard_block(&self, host: &mut dyn ServerHost, player: PlayerRef, pos: [i32; 3], node: &str) -> Flow {
+        let Some((world, _)) = player_world(&*host, player) else { return Flow::Continue };
+        if !chunky::with(|e| e.borders.block_blocked(world, pos, false)) {
+            return Flow::Continue;
+        }
+        if player.permission_bool(host, &typed(node)).unwrap_or(false) {
+            Flow::Continue
+        } else {
+            Flow::Cancel
+        }
+    }
+
+    /// `ChunkyBorder`'s teleport handler for a player whose destination `target` is outside the border: cancelled when
+    /// `prevent`, else moved to just inside the nearest edge (or the world spawn).
+    fn pull_in(&self, host: &mut dyn ServerHost, player: PlayerRef, target: &mut [f64; 3], prevent: bool, kind: RedirectKind) -> Flow {
+        let Some((world, dim)) = player_world(&*host, player) else { return Flow::Continue };
+        if chunky::with(|e| e.borders.get(world).is_none()) {
+            return Flow::Continue;
+        }
+        let bypass = player.permission_bool(host, &typed(BYPASS_MOVE)).unwrap_or(false);
+        let answer = chunky::with(|e| e.borders.teleport_redirect(player.uuid(), world, *target, bypass, kind));
+        match answer {
+            None => Flow::Continue,
+            Some(_) if prevent => Flow::Cancel,
+            Some(Some(r)) => {
+                let mut to = r.to;
+                if let Some(y) = ground(&*host, &dim, to) {
+                    to[1] = y;
+                }
+                *target = to;
+                Flow::Continue
+            }
+            Some(None) => {
+                if let Some(spawn) = host.level(dimension_of(world)).and_then(|l| spawn_of(&*host, l)) {
+                    *target = spawn;
+                }
+                Flow::Continue
+            }
+        }
+    }
+
+    /// `BorderCheckTask`: every `check-interval` ticks each player of this level outside its border goes back (or
+    /// wraps); the visualizer draws the wall every tick.
+    fn border_tick(&self, host: &mut dyn ServerHost, level: LevelRef, dim: &str) {
+        let Some(world) = canon_world(dim) else { return };
+        let (interval, bordered, visualizer, trident) = chunky::with(|e| {
+            let c = &e.borders.config;
+            (c.check_interval.max(1), e.borders.get(world).is_some(), c.visualizer_enabled, c.prevent_trident)
+        });
+        if !bordered {
+            return;
+        }
+        let tick = {
+            let mut ticks = lock(&self.border_ticks);
+            let n = ticks.entry(dim.to_owned()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        if visualizer {
+            self.visualize(host, level, dim, world, tick);
+        }
+        if trident {
+            self.guard_tridents(host, level, dim, world);
+        }
+        if tick % interval != 0 {
+            return;
+        }
+        for player in host.players().server_players() {
+            if player.dimension(&*host).map(|d| d.to_string()).as_deref() != Some(dim) {
+                continue;
+            }
+            let entity = player.entity();
+            let Some(pos) = entity.position(&*host) else { continue };
+            let rot = entity.rotation(&*host).unwrap_or([0.0, 0.0]);
+            let bypass = player.permission_bool(host, &typed(BYPASS_MOVE)).unwrap_or(false);
+            let spawn = spawn_of(&*host, level);
+            let Some(redirect) = chunky::with(|e| e.borders.check(player.uuid(), world, pos, rot, spawn, bypass)) else {
+                continue;
+            };
+            self.send_back(host, level, dim, player, pos, redirect);
+        }
+    }
+
+    /// `prevent-trident` (`onProjectileLaunch`): a trident a player threw stops at the border. Past it the trident's
+    /// velocity is zeroed and it goes back to its last position inside; one that would cross on its next tick loses its
+    /// velocity. Tridents are found in a box of 128 blocks around their thrower.
+    fn guard_tridents(&self, host: &mut dyn ServerHost, level: LevelRef, dim: &str, world: &str) {
+        let mut seen: Vec<(EntityRef, [f64; 3])> = Vec::new();
+        for player in host.players().server_players() {
+            if player.dimension(&*host).map(|d| d.to_string()).as_deref() != Some(dim) {
+                continue;
+            }
+            if chunky::with(|e| e.borders.is_bypassing(player.uuid()))
+                || player.permission_bool(host, &typed(BYPASS_MOVE)).unwrap_or(false)
+            {
+                continue;
+            }
+            let owner = player.entity();
+            let Some(at) = owner.position(&*host) else { continue };
+            let (min, max) = ([at[0] - 128.0, at[1] - 128.0, at[2] - 128.0], [at[0] + 128.0, at[1] + 128.0, at[2] + 128.0]);
+            let Some(found) = level.entities_in(&*host, min, max) else { continue };
+            for thrown in found {
+                let is_trident = thrown.kind(&*host).is_some_and(|k| k.id(&*host).to_string().rsplit(':').next() == Some("trident"));
+                if !is_trident {
+                    continue;
+                }
+                let Some(projectile) = host.projectile(thrown) else { continue };
+                if projectile.owner(&*host) != Some(owner) {
+                    continue;
+                }
+                let Some(pos) = thrown.position(&*host) else { continue };
+                let previous = lock(&self.tridents).iter().find(|(t, _)| *t == thrown).map(|(_, p)| *p);
+                let inside = |p: [f64; 3]| chunky::with(|e| e.borders.inside(world, p[0], p[2]));
+                if !inside(pos) {
+                    let _ = thrown.set_velocity(host, [0.0, 0.0, 0.0]);
+                    if let Some(back) = previous {
+                        let _ = thrown.teleport_to(host, back, None);
+                        seen.push((thrown, back));
+                    }
+                    continue;
+                }
+                let v = thrown.velocity(&*host).unwrap_or([0.0, 0.0, 0.0]);
+                if !inside([pos[0] + v[0], pos[1] + v[1], pos[2] + v[2]]) {
+                    let _ = thrown.set_velocity(host, [0.0, 0.0, 0.0]);
+                }
+                seen.push((thrown, pos));
+            }
+        }
+        *lock(&self.tridents) = seen;
+    }
+
+    /// The effect, the sound, the teleport and the message of a redirected player (`BorderCheckTask.check`).
+    fn send_back(&self, host: &mut dyn ServerHost, level: LevelRef, dim: &str, player: PlayerRef, from: [f64; 3], mut redirect: Redirect) {
+        if redirect.needs_ground {
+            if let Some(y) = ground(&*host, dim, redirect.to) {
+                redirect.to[1] = y;
+                chunky::with(|e| e.borders.set_last(player.uuid(), canon_world(dim).unwrap_or("world"), redirect.to));
+            }
+        }
+        let (effect, sound, message, action_bar) = chunky::with(|e| {
+            let c = &e.borders.config;
+            (c.effect.clone(), c.sound_key(), c.message.clone(), c.use_action_bar)
+        });
+        let entity = player.entity();
+        self.play_effect(host, level, &effect, from);
+        if let Some(sound) = sound {
+            let _ = entity.play_sound(host, &sound, 1.0, 1.0);
+        }
+        let _ = entity.teleport_to(host, redirect.to, Some([redirect.yaw, redirect.pitch]));
+        if !message.trim().is_empty() {
+            let text = legacy_text(&message);
+            if action_bar {
+                let _ = player.action_bar(host, text);
+            } else {
+                let _ = player.tell(host, text);
+            }
+        }
+    }
+
+    /// The config's `effect` (a Bukkit effect name) as particles at the old position; the names this knows are the
+    /// ones with a plain particle of their own.
+    fn play_effect(&self, host: &mut dyn ServerHost, level: LevelRef, effect: &str, at: [f64; 3]) {
+        let name = match effect.to_ascii_lowercase().as_str() {
+            "ender_signal" => "portal",
+            "smoke" => "smoke",
+            "mobspawner_flames" => "flame",
+            "potion_break" => "effect",
+            _ => return,
+        };
+        let Some(key) = lock(&self.particles).get(name).copied() else { return };
+        let _ = level.send_particles(host, &ParticleOptions::simple(key), None, [at[0], at[1] + 1.0, at[2]], [0.3, 0.5, 0.3], 0.1, 24);
+    }
+
+    /// ChunkyBorder's visualizer: dust along the wall near each player, moving a twentieth of a block a tick. The
+    /// particles go to everyone in range, not only to the player the wall is drawn for.
+    fn visualize(&self, host: &mut dyn ServerHost, level: LevelRef, dim: &str, world: &str, tick: u64) {
+        let (range, color, border) = chunky::with(|e| {
+            (e.borders.config.visualizer_range.max(1) as f64, e.borders.config.visualizer_color.clone(), e.borders.get(world).cloned())
+        });
+        let Some(border) = border else { return };
+        let Some(dust) = lock(&self.particles).get("dust").copied() else { return };
+        let rgb = u32::from_str_radix(color.trim_start_matches('#'), 16).unwrap_or(0x20A0FF);
+        let mut options = ParticleOptions::simple(dust);
+        options.color = [((rgb >> 16) & 0xFF) as f32 / 255.0, ((rgb >> 8) & 0xFF) as f32 / 255.0, (rgb & 0xFF) as f32 / 255.0, 1.0];
+        options.scale = 1.0;
+        let offset = (tick % 20) as f64 / 20.0;
+        for player in host.players().server_players() {
+            if player.dimension(&*host).map(|d| d.to_string()).as_deref() != Some(dim) {
+                continue;
+            }
+            let Some(pos) = player.entity().position(&*host) else { continue };
+            let points = border.visualizer_points(pos, range, offset);
+            if !points.is_empty() {
+                let _ = level.send_particles_at(host, &options, None, &points, [0.0, 0.0, 0.0], 0.0, 1);
+            }
+        }
+    }
+
+    /// Tells the mods that subscribed (`api`) what Chunky and the border did since the last tick: each gets one call
+    /// of its service `<id>:chunky_event` per event. A mod that is gone is dropped from the list.
+    fn deliver_events(&self, host: &mut dyn ServerHost) {
+        let lines: Vec<String> = chunky::with(|e| {
+            let mut lines = e.take_api_events();
+            for event in e.borders.take_events() {
+                lines.push(match event {
+                    BorderEvent::Change { world, border } => api::border_change_event(&world, border.as_ref()),
+                    BorderEvent::Redirect { player, world, from, to, kind } => {
+                        api::border_redirect_event(player, &world, from, to, kind)
+                    }
+                });
+            }
+            lines
+        });
+        if lines.is_empty() {
+            return;
+        }
+        for id in chunky::with(|e| e.subscribers().to_vec()) {
+            let service = format!("{id}:chunky_event");
+            for line in &lines {
+                if let Err(ModServiceError::ProviderNotLoaded) = host.commands().call_mod_service(&service, line.as_bytes()) {
+                    chunky::with(|e| e.unsubscribe(&id));
+                    break;
+                }
+            }
+        }
+    }
+
     /// Releases the tickets of `controller` that an earlier run left in `level`'s save, once per dimension. They would
     /// keep their chunks loaded for good: the engine does not know them, and the controller is registered, so the world
     /// keeps them across restarts.
@@ -705,9 +1098,7 @@ impl Mod {
         }
     }
 
-    /// Erases the next chunks of the dimension's live trim. Needs `LevelRef::delete_chunks`, which is on the engine
-    /// branch `rec-world-data` and not yet in the SDK (feature `next-engine`).
-    #[cfg(feature = "next-engine")]
+    /// Erases the next chunks of the dimension's live trim (`LevelRef::delete_chunks`).
     fn live_trim_step(&self, host: &mut dyn ServerHost, level: LevelRef, dim: &str) {
         let batch = chunky::with(|e| e.take_live_trim_batch(dim, chunky::now_ms()));
         if batch.is_empty() {

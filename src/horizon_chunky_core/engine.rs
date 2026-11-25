@@ -1,6 +1,8 @@
 //! Tasks, commands and the per-tick work, without any game types so it can be tested.
 
 use crate::horizon_chunky_core::genmap;
+use super::border::{BorderData, Borders, Wrap};
+use super::api;
 use crate::horizon_chunky_core::lang::tr;
 use crate::horizon_chunky_core::geom::{self, Chunk, ChunkList, Pattern, Selection, Shape};
 use crate::horizon_chunky_core::region::{self, ExistingIndex};
@@ -172,6 +174,8 @@ struct Task {
     ticks: u64,
     last_ms: Option<u64>,
     last_msg_ms: Option<u64>,
+    /// When the last progress event for other mods went out (`GenerationProgressEvent`).
+    last_event_ms: Option<u64>,
     last_save_ms: u64,
     session_start: (u64, u64),
     current: Chunk,
@@ -205,6 +209,7 @@ impl Task {
             ticks: 0,
             last_ms: None,
             last_msg_ms: None,
+            last_event_ms: None,
             last_save_ms: 0,
             session_start: (done, elapsed_ms),
             current: (0, 0),
@@ -397,6 +402,12 @@ pub struct Engine {
     /// instead of waiting for the next start.
     live_trim: bool,
     live_trims: Vec<LiveTrim>,
+    /// ChunkyBorder's borders, its config and its players' state.
+    pub borders: Borders,
+    /// Events for the mods that subscribed to the API (`api::event_*`), taken by the glue.
+    api_events: Vec<String>,
+    /// The mod ids that receive them.
+    subscribers: Vec<String>,
 }
 
 impl Engine {
@@ -427,6 +438,9 @@ impl Engine {
             async_lines: Arc::new(Mutex::new(Vec::new())),
             live_trim: false,
             live_trims: Vec::new(),
+            borders: Borders::default(),
+            api_events: Vec::new(),
+            subscribers: Vec::new(),
         }
     }
 
@@ -507,6 +521,87 @@ impl Engine {
     pub fn set_base(&mut self, base: PathBuf) {
         self.dir = Some(base.join("tasks"));
         self.base = Some(base);
+    }
+
+    /// ChunkyBorder's folder (`config/chunkyborder`): its config and `borders.json` are read now.
+    pub fn set_border_dir(&mut self, dir: &std::path::Path) {
+        self.borders = Borders::load(dir);
+    }
+
+    /// The events for subscribed mods since the last call, as `api` writes them.
+    pub fn take_api_events(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.api_events)
+    }
+
+    pub fn subscribers(&self) -> &[String] {
+        &self.subscribers
+    }
+
+    pub fn subscribe(&mut self, id: &str) {
+        if !self.subscribers.iter().any(|s| s == id) {
+            self.subscribers.push(id.to_owned());
+        }
+    }
+
+    pub fn unsubscribe(&mut self, id: &str) {
+        self.subscribers.retain(|s| s != id);
+    }
+
+    /// `ChunkyAPI.isRunning`: a task is running in the world.
+    pub fn api_is_running(&self, world: &str) -> bool {
+        canon_world(world).is_some_and(|w| self.tasks.get(w).is_some_and(|t| t.run == Run::Running))
+    }
+
+    /// `ChunkyAPI.startTask`: false for an unknown world or one with a running task. An unknown shape is a square, an
+    /// unknown pattern the ring, as Chunky's factories fall back.
+    pub fn api_start(&mut self, world: &str, shape: &str, cx: f64, cz: f64, rx: f64, rz: f64, pattern: &str) -> bool {
+        let Some(w) = canon_world(world).map(str::to_owned) else { return false };
+        if self.api_is_running(&w) {
+            return false;
+        }
+        let sel = Selection {
+            shape: Shape::parse(shape).unwrap_or(Shape::Square),
+            pattern: Pattern::parse(pattern, None).unwrap_or(Pattern::Ring),
+            cx,
+            cz,
+            radius: rx,
+            radius_z: rz,
+        };
+        self.sender.clear();
+        self.start_task(&w, sel);
+        self.tasks.contains_key(&w)
+    }
+
+    /// `ChunkyAPI.pauseTask`: false when no task is running there.
+    pub fn api_pause(&mut self, world: &str) -> bool {
+        let Some(w) = canon_world(world).map(str::to_owned) else { return false };
+        if !self.api_is_running(&w) {
+            return false;
+        }
+        self.pause_one(&w);
+        true
+    }
+
+    /// `ChunkyAPI.continueTask`: resumes the world's paused task.
+    pub fn api_continue(&mut self, world: &str) -> bool {
+        let Some(w) = canon_world(world).map(str::to_owned) else { return false };
+        if !self.tasks.get(&w).is_some_and(|t| t.run == Run::Paused) {
+            return false;
+        }
+        self.sender.clear();
+        let names = [w.as_str()];
+        self.cmd_continue(&names);
+        true
+    }
+
+    /// `ChunkyAPI.cancelTask`: drops the world's running task for good.
+    pub fn api_cancel(&mut self, world: &str) -> bool {
+        let Some(w) = canon_world(world).map(str::to_owned) else { return false };
+        if !self.api_is_running(&w) {
+            return false;
+        }
+        self.cancel_now(Some(&w));
+        true
     }
 
     /// The open world's folder (the glue's `native_world_dir`).
@@ -676,6 +771,7 @@ impl Engine {
         let over_budget = self.last_level_ms > cfg.tick_budget_ms;
         let mut finished = Vec::new();
         let mut save = Vec::new();
+        let mut api_events = Vec::new();
         let already = self.loaded.get(dim);
         let world_dir = self.world_dir.clone();
         for (w, t) in self.tasks.iter_mut().filter(|(w, _)| dimension_of(w) == dim) {
@@ -771,8 +867,14 @@ impl Engine {
                     out.notify.push((owner.clone(), line.clone()));
                 }
                 out.log.push(line);
+                api_events.push(api::progress_event(w, t.done, true, t.percent(), t.elapsed_ms, t.rate(), t.current));
+                api_events.push(api::complete_event(w, &t.sel, t.owner.as_deref(), t.total, t.elapsed_ms, "COMPLETED"));
                 finished.push(w.clone());
                 continue;
+            }
+            if t.last_event_ms.is_none_or(|m| now_ms.saturating_sub(m) >= cfg.update_interval * 1000) {
+                t.last_event_ms = Some(now_ms);
+                api_events.push(api::progress_event(w, t.done, false, t.percent(), t.elapsed_ms, t.rate(), t.current));
             }
             let due = t.last_msg_ms.is_none_or(|m| now_ms.saturating_sub(m) >= cfg.update_interval * 1000);
             if due && !cfg.silent {
@@ -784,6 +886,7 @@ impl Engine {
                 save.push(w.clone());
             }
         }
+        self.api_events.append(&mut api_events);
         for w in save {
             if let Some(t) = self.tasks.get(&w) {
                 self.save(&w, false, t);
@@ -874,6 +977,7 @@ impl Engine {
             "trim" => self.cmd_trim(rest, now_ms),
             "confirm" => self.cmd_confirm(now_ms),
             "reload" => self.cmd_reload(rest),
+            "border" => self.cmd_border(rest, who),
             "limit" => self.cmd_limit(rest),
             "debug" => match rest.first().map(|s| s.to_ascii_lowercase()).as_deref() {
                 Some("map") => self.cmd_debug_map(),
@@ -1023,6 +1127,7 @@ impl Engine {
             self.release_later.entry(w.to_owned()).or_default().extend(held);
         }
         self.save(w, false, &t);
+        self.api_events.push(api::start_event(w, &t.sel, t.owner.as_deref(), false));
         self.tasks.insert(w.to_owned(), t);
         vec![pre(format!(
             "Task started in {} for the {} region centered at {}, {} with radius {}.",
@@ -1056,6 +1161,7 @@ impl Engine {
         if let Some(t) = self.tasks.get_mut(w) {
             if t.run == Run::Running {
                 self.console.push(pre(format!("Task stopped for {}.", display_world(w))));
+                self.api_events.push(api::complete_event(w, &t.sel, t.owner.as_deref(), t.done, t.elapsed_ms, "PAUSED"));
             }
             t.run = Run::Paused;
             let held = t.rewind();
@@ -1088,6 +1194,7 @@ impl Engine {
                         t.owner = Some(sender.clone());
                     }
                     t.session_start = (t.done, t.elapsed_ms);
+                    self.api_events.push(api::start_event(&w, &t.sel, t.owner.as_deref(), true));
                     out.push(pre(format!("Task continuing for {}.", display_world(&w))));
                 }
             }
@@ -1135,6 +1242,7 @@ impl Engine {
                 if t.run == Run::Running {
                     self.console.push(pre(format!("Task stopped for {}.", display_world(&w))));
                 }
+                self.api_events.push(api::complete_event(&w, &t.sel, t.owner.as_deref(), t.done, t.elapsed_ms, "CANCELLED"));
                 let held = t.rewind();
                 self.release_later.entry(w.clone()).or_default().extend(held);
                 self.save(&w, true, &t);
@@ -1150,6 +1258,7 @@ impl Engine {
                 if t.run == Run::Running {
                     self.console.push(pre(format!("Task stopped for {}.", display_world(&w))));
                 }
+                self.api_events.push(api::complete_event(&w, &t.sel, t.owner.as_deref(), t.done, t.elapsed_ms, "CANCELLED"));
                 let held = t.rewind();
                 self.release_later.entry(w.clone()).or_default().extend(held);
                 self.save(&w, true, &t);
@@ -1503,10 +1612,120 @@ impl Engine {
         out
     }
 
+    /// `border <add|remove|wrap|list|load|bypass|help>` (ChunkyBorder's `BorderCommand`): anything else is its help line.
+    fn cmd_border(&mut self, rest: &[&str], who: &Who) -> Vec<String> {
+        let help = vec![help_line("border")];
+        let Some((sub, args)) = rest.split_first() else { return help };
+        match sub.to_ascii_lowercase().as_str() {
+            "add" => {
+                // The selection takes `[world] [shape] [x z] [radius] [z radius]` as `start` reads them; every
+                // wrong word answers with the border help.
+                if self.apply_area(args, "").is_err() {
+                    return help;
+                }
+                let (sel, w) = (self.selection.clone(), self.selected_world.clone());
+                self.borders.add(BorderData { world: w.clone(), shape: sel.shape, cx: sel.cx, cz: sel.cz, rx: sel.radius, rz: sel.radius_z, wrap: Wrap::None });
+                vec![pre(format!(
+                    "Added {} world border to {} with center {}, {}, and radius {}.",
+                    sel.shape.name(),
+                    display_world(&w),
+                    number(sel.cx),
+                    number(sel.cz),
+                    radius_text(&sel)
+                ))]
+            }
+            "remove" => {
+                if !self.border_world(args) {
+                    return help;
+                }
+                let w = self.selected_world.clone();
+                if self.borders.remove(&w) {
+                    vec![pre(format!("Removed world border from {}.", display_world(&w)))]
+                } else {
+                    vec![pre(format!("No world border exists for {}.", display_world(&w)))]
+                }
+            }
+            "load" => {
+                if !self.border_world(args) {
+                    return help;
+                }
+                let w = self.selected_world.clone();
+                let Some(b) = self.borders.get(&w).cloned() else {
+                    return vec![pre(format!("No world border exists for {}.", display_world(&w)))];
+                };
+                self.selection.shape = b.shape;
+                self.selection.cx = b.cx;
+                self.selection.cz = b.cz;
+                self.selection.radius = b.rx;
+                self.selection.radius_z = b.rz;
+                vec![pre(format!("Selection loaded from world border for {}.", display_world(&w)))]
+            }
+            "list" => {
+                if self.borders.all().next().is_none() {
+                    return vec![pre("There are no world borders.")];
+                }
+                let mut out = vec![pre("World Borders")];
+                for b in self.borders.all() {
+                    out.push(format!(
+                        "{}: {} with center {}, {} and radius {}.",
+                        display_world(&b.world),
+                        b.shape.name(),
+                        number(b.cx),
+                        number(b.cz),
+                        radius_text(&b.selection())
+                    ));
+                }
+                out
+            }
+            "wrap" => {
+                let w = self.selected_world.clone();
+                if self.borders.get(&w).is_none() {
+                    return vec![pre(format!("No world border exists for {}.", display_world(&w)))];
+                }
+                let wrap = args.first().map_or(Wrap::None, |s| Wrap::parse(s));
+                self.borders.set_wrap(&w, wrap);
+                vec![pre(format!("World border wrap changed to {} for {}.", wrap.name(), display_world(&w)))]
+            }
+            "bypass" => {
+                let target = match args.first() {
+                    Some(name) => self.borders.player_named(name),
+                    None if who.sender.is_empty() => return Vec::new(),
+                    None => self.borders.player_named(&who.sender),
+                };
+                let Some((name, id)) = target else {
+                    return match args.first() {
+                        Some(name) => vec![pre(format!("Cannot find a player by the name {name}."))],
+                        None => Vec::new(),
+                    };
+                };
+                let on = !self.borders.is_bypassing(id);
+                self.borders.set_bypassing(id, on);
+                vec![pre(format!("Temporary border bypass {} for {}.", if on { "enabled" } else { "disabled" }, name))]
+            }
+            _ => help,
+        }
+    }
+
+    /// The optional world word of `border remove` and `border load`: it selects the world; false for an unknown one.
+    fn border_world(&mut self, args: &[&str]) -> bool {
+        match args.first() {
+            Some(name) => match canon_world(name) {
+                Some(w) => {
+                    self.selected_world = w.into();
+                    true
+                }
+                None => false,
+            },
+            None => true,
+        }
+    }
+
     fn reload_config(&mut self) -> Vec<String> {
         let Some(base) = self.base.clone() else { return vec![pre("The config folder is not known yet.")] };
         self.cfg = read_config(&base);
         crate::horizon_chunky_core::lang::set_language(&self.cfg.language);
+        // ChunkyBorder listens to Chunky's reload: its config and its borders are read again.
+        self.borders.reload();
         Vec::new()
     }
 
@@ -1705,6 +1924,7 @@ fn help_line(name: &str) -> String {
 
 fn help_plain(name: &str) -> &'static str {
     match name {
+        "border" => "chunky border <add|remove|wrap|list|load|bypass> - Manage custom world borders",
         "cancel" => "chunky cancel - Stop and delete current or saved tasks",
         "center" => "chunky center <x> <z> - Set the center block location",
         "continue" => "chunky continue - Continue current or saved tasks",
@@ -1731,7 +1951,7 @@ fn help_plain(name: &str) -> &'static str {
 
 /// Chunky's help menu (`HelpCommand`): every command for the console; eight to a page for a player.
 fn help(page: Option<i64>, player: bool) -> Vec<String> {
-    const LISTED: [&str; 19] = [
+    const LISTED: [&str; 20] = [
         "start",
         "pause",
         "continue",
@@ -1750,6 +1970,7 @@ fn help(page: Option<i64>, player: bool) -> Vec<String> {
         "trim",
         "selection",
         "progress",
+        "border",
         "reload",
     ];
     let last = LISTED.len() / 8;
@@ -2340,5 +2561,95 @@ mod tests {
             f.notices(),
             ["[Chunky] &eNotice: Filtering chunks that have not been modified in the last 2 days. Chunks without a known modification time will not be deleted."]
         );
+    }
+    #[test]
+    fn border_add_list_load_wrap_and_remove_answer_in_chunkys_lines() {
+        let mut e = engine(None);
+        let w = Who::default();
+        let say = |e: &mut Engine, line: &str| e.command(line, &Who::default(), 0);
+        assert_eq!(say(&mut e, "chunky border list"), ["[Chunky] There are no world borders."]);
+        assert_eq!(
+            say(&mut e, "chunky border add world circle 10 -20 500"),
+            ["[Chunky] Added circle world border to world with center 10, -20, and radius 500."]
+        );
+        assert_eq!(
+            say(&mut e, "chunky border add world_nether rectangle 0 0 100 50"),
+            ["[Chunky] Added rectangle world border to world_nether with center 0, 0, and radius 100, 50."]
+        );
+        // `add` writes the selection, as the add-on does.
+        assert_eq!((e.selection.shape, e.selection.radius, e.selected_world.as_str()), (Shape::Rectangle, 100.0, "world_nether"));
+        assert_eq!(
+            say(&mut e, "chunky border list"),
+            ["[Chunky] World Borders", "world: circle with center 10, -20 and radius 500.", "world_nether: rectangle with center 0, 0 and radius 100, 50."]
+        );
+        assert_eq!(say(&mut e, "chunky border wrap"), ["[Chunky] World border wrap changed to none for world_nether."]);
+        assert_eq!(say(&mut e, "chunky border wrap earth"), ["[Chunky] World border wrap changed to earth for world_nether."]);
+        assert_eq!(e.borders.get("world_nether").unwrap().wrap, Wrap::Earth);
+        // A border added again keeps its wrap; `load` copies a border into the selection.
+        say(&mut e, "chunky border add world_nether square 0 0 80");
+        assert_eq!(e.borders.get("world_nether").unwrap().wrap, Wrap::Earth);
+        assert_eq!(say(&mut e, "chunky border load world"), ["[Chunky] Selection loaded from world border for world."]);
+        assert_eq!((e.selection.shape, e.selection.cx, e.selection.cz, e.selection.radius), (Shape::Circle, 10.0, -20.0, 500.0));
+        assert_eq!(say(&mut e, "chunky border remove world"), ["[Chunky] Removed world border from world."]);
+        assert_eq!(say(&mut e, "chunky border remove world"), ["[Chunky] No world border exists for world."]);
+        assert_eq!(say(&mut e, "chunky border load world"), ["[Chunky] No world border exists for world."]);
+        // Wrong words answer with the border help; a missing word too.
+        let help = vec!["&2chunky border <add|remove|wrap|list|load|bypass>&r - Manage custom world borders".to_owned()];
+        assert_eq!(say(&mut e, "chunky border add narnia"), help);
+        assert_eq!(say(&mut e, "chunky border add world blob"), help);
+        assert_eq!(say(&mut e, "chunky border add world circle 5"), help);
+        assert_eq!(say(&mut e, "chunky border"), help);
+        assert_eq!(say(&mut e, "chunky border help"), help);
+        let _ = w;
+    }
+
+    #[test]
+    fn border_bypass_toggles_the_senders_or_a_named_players_switch() {
+        let mut e = engine(None);
+        e.borders.set_online(&[("Alex".to_owned(), 1), ("Sam".to_owned(), 2)]);
+        let alex = Who { sender: "alex".into(), ..Default::default() };
+        assert_eq!(e.command("chunky border bypass", &alex, 0), ["[Chunky] Temporary border bypass enabled for Alex."]);
+        assert!(e.borders.is_bypassing(1));
+        assert_eq!(e.command("chunky border bypass sam", &alex, 0), ["[Chunky] Temporary border bypass enabled for Sam."]);
+        assert_eq!(e.command("chunky border bypass", &alex, 0), ["[Chunky] Temporary border bypass disabled for Alex."]);
+        assert_eq!(e.command("chunky border bypass bob", &alex, 0), ["[Chunky] Cannot find a player by the name bob."]);
+        // The console has no switch of its own.
+        assert!(e.command("chunky border bypass", &Who::default(), 0).is_empty());
+    }
+
+    #[test]
+    fn the_help_menu_lists_border_before_reload() {
+        let lines = e_help();
+        let border = lines.iter().position(|l| l.contains("chunky border")).unwrap();
+        assert!(lines[border + 1].contains("chunky reload"));
+        assert_eq!(lines.len(), 21, "title and twenty commands for the console");
+    }
+
+    fn e_help() -> Vec<String> {
+        help(None, false)
+    }
+
+    #[test]
+    fn a_task_finishing_tells_subscribers_progress_then_completion() {
+        let mut e = engine(None);
+        e.subscribe("mapper");
+        e.command("chunky start world square 0 0 8", &Who::default(), 0);
+        let mut events = e.take_api_events();
+        assert!(events[0].starts_with("generation_start\tworld\tsquare\t0\t0\t8"), "{}", events[0]);
+        events.clear();
+        for n in 0..400u64 {
+            let a = e.tick("minecraft:overworld", n * 50);
+            for c in a.hold {
+                e.chunk_loaded("minecraft:overworld", c);
+            }
+            events.extend(e.take_api_events());
+            if e.tasks.is_empty() {
+                break;
+            }
+        }
+        assert!(events.iter().any(|l| l.starts_with("generation_progress\tworld\t") && l.contains("\tfalse\t")), "{events:?}");
+        let n = events.len();
+        assert!(events[n - 2].starts_with("generation_progress\tworld\t") && events[n - 2].contains("\ttrue\t100"), "{events:?}");
+        assert!(events[n - 1].starts_with("generation_complete\tworld\tsquare") && events[n - 1].ends_with("\tCOMPLETED"), "{events:?}");
     }
 }

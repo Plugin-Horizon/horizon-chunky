@@ -44,7 +44,26 @@ one or two; the side word of `trim` comes after both radii. `cancel`, `start` ov
 `limit <rate>` caps a task at that many chunks per second (0 for none; saved with the task). A player who starts or continues a task is told when it finishes, and `confirm` is kept per sender. Tab completion offers world (custom dimensions too), shape, pattern, trim-side and trim-filter words.
 
 `debug map` writes `config/chunky/debug/<world>.png`. Trim filters: `inhabited=<min>..<max>` and `unmodified=<amount><unit>`.
-Not ported: the `border` subcommands (ChunkyBorder is not on Horizon). See the Known gaps section.
+
+### Border (ChunkyBorder)
+
+`chunky border <add|remove|wrap|list|load|bypass|help>` is ChunkyBorder's command (GPL-3.0, pop4959/ChunkyBorder), node
+`chunky.command.border`. `add [world] [shape] [x z] [radius] [z radius]` reads the words as `start` does and writes the
+selection; `load [world]` copies a border into the selection; `wrap [none|default|both|radial|x|z|earth]` sets what
+happens at the edge. Borders are kept in `config/chunkyborder/borders.json` (Gson's layout, so the Java file can be
+copied in), the options in `config/chunkyborder/config.yml` or `config.toml` (`border-options` keys: `check-interval`,
+`message`, `use-action-bar`, `effect`, `sound`, `prevent-mob-spawns`, `-enderpearl`, `-chorus-fruit`, `-end-gateway`,
+`-trident`, `visualizer-enabled`, `-range`, `-color`). Players outside a border are sent back (or wrapped) every
+`check-interval` ticks; nodes `chunkyborder.bypass.move`, `.place`, `.break` (default nobody) or `border bypass` let one through.
+
+### API for other mods
+
+`chunky:api` is a mod service (`host.commands().call_mod_service("chunky:api", bytes)`): one tab-separated line in, one
+text line out. Chunky's calls: `version`, `is_running <world>`, `start_task <world> <shape> <x> <z> <rx> <rz> <pattern>`,
+`pause_task`, `continue_task`, `cancel_task`; ChunkyBorder's: `border_get`, `border_add`, `border_remove`,
+`border_set_wrap`, `border_inside`, `border_is_bypassing`, `border_set_bypassing`. `subscribe <mod id>` makes Chunky
+call `<mod id>:chunky_event` with `generation_start`, `generation_progress`, `generation_complete`, `border_change` or
+`border_redirect` lines (fields in the order of the Java records). The layout is in `src/horizon_chunky_core/api.rs`.
 
 ## Shapes and patterns
 
@@ -97,9 +116,9 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 What does not work yet:
 
-- `start` checks `radius-limit` from `config/chunky/.chunky.properties`; Chunky's disk-space message is not ported (the original never prints it).
-- The `border` subcommands (the ChunkyBorder add-on) are not ported (add-on not installed).
-- Live trim needs `LevelRef::delete_chunks`, which is on the engine branch `rec-world-data` and not yet in the SDK: with the cargo feature `next-engine` a confirmed trim erases chunks a few per tick while the server runs (chunks that are loaded or held wait and are retried every 5 s); without it a confirmed trim is written to `trim-pending.properties` and applied at the next start, as before.
-- The aggregate node `chunky.chunky` (default nobody, children: the root and every subcommand node but trim) and the `children: [chunky.command]` of each subcommand node follow plugin.yml (`add_with_children`).
-- A Java `config.yml` copied into `config/chunky/` is read when `config.toml` is absent (same keys).
+- The disk-space message (`format_start_disk`) is not ported: the original defines it but no command prints it. `start` checks `radius-limit` from `config/chunky/.chunky.properties`.
+- Border: the squaremap marker layer needs the squaremap mod to subscribe to the border events (dynmap, BlueMap and Pl3xMap markers are Java-only). An end gateway whose exit lies outside the border is cancelled with `prevent-end-gateway` but cannot be moved inside (the landing is read-only: ENGINE_NEEDS `player_teleport_end_gateway_landing_mut`). The visualizer's dust goes to everyone in range, not only to the player it is drawn for; the border effect `ender_signal` is drawn as portal particles.
+- Live trim runs while the server is up (`LevelRef::delete_chunks`): a confirmed trim erases chunks a few per tick; chunks that are loaded or held wait and are retried every 5 s.
+- The aggregate node `chunky.chunky` (default nobody, children: the root and every subcommand node but trim and border) and the `children: [chunky.command]` of each subcommand node follow plugin.yml (`add_with_children`).
+- A Java `config.yml` copied into `config/chunky/` is read when `config.toml` is absent (same keys; its `version` key is ignored).
 - Messages are translated by matching each printed line against `lang/en.json` (see `src/horizon_chunky_core/lang.rs`); a line whose wording differs from that file is printed in English.
