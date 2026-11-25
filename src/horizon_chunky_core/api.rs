@@ -8,7 +8,8 @@
 //! `pause_task <world>`, `continue_task <world>`, `cancel_task <world>`, `subscribe <id>`, `unsubscribe <id>`;
 //! the border API: `border_version`, `border_get <world>` (`<world> <shape> <x> <z> <rx> <rz> <wrap>`),
 //! `border_add <world> <shape> <x> <z> <rx> <rz>`, `border_remove <world>`, `border_set_wrap <world> <wrap>`,
-//! `border_inside <world> <x> <z>`, `border_is_bypassing <uuid>`, `border_set_bypassing <uuid> <true|false>`.
+//! `border_inside <world> <x> <z>`, `border_is_bypassing <uuid>`, `border_set_bypassing <uuid> <true|false>`,
+//! `map_options` (`<bluemap> <dynmap> <pl3xmap> <squaremap> <label> <hide-by-default> <color> <weight> <priority>`).
 //! Events: `generation_start`, `generation_progress`, `generation_complete`, `border_change`, `border_redirect`.
 
 use super::border::{BorderData, RedirectKind, Wrap};
@@ -118,6 +119,7 @@ pub fn handle(e: &mut Engine, payload: &str) -> Option<String> {
             "true".into()
         }
         "border_get" => e.borders.get(&world_key(word(0)?)).map_or_else(|| "none".to_owned(), border_fields),
+        "map_options" => e.borders.config.map.fields(),
         "border_add" => {
             let (Some(world), Some(shape)) = (canon_world(word(0)?), Shape::parse(word(1)?)) else { return Some("false".into()) };
             let (cx, cz, rx, rz) = (num(2)?, num(3)?, num(4)?, num(5)?);
@@ -199,6 +201,12 @@ mod tests {
         assert!(e.take_api_events().is_empty());
         handle(&mut e, "unsubscribe\tmapper");
         assert!(e.subscribers().is_empty());
+    }
+
+    #[test]
+    fn map_options_are_served_to_the_map_mods() {
+        let mut e = engine();
+        assert_eq!(handle(&mut e, "map_options").as_deref(), Some("true\ttrue\ttrue\ttrue\tWorld Border\tfalse\tFF0000\t3\t0"));
     }
 
     #[test]

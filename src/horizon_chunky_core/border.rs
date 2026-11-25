@@ -410,6 +410,109 @@ struct Last {
     pos: [f64; 3],
 }
 
+/// ChunkyBorder's `map-options`: which map mods draw the border and how (`BukkitConfig.blueMapEnabled` ...
+/// `priority`). The map mods read these from the `map_options` service call.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MapOptions {
+    pub bluemap: bool,
+    pub dynmap: bool,
+    pub pl3xmap: bool,
+    pub squaremap: bool,
+    pub label: String,
+    pub hide_by_default: bool,
+    /// `RRGGBB` without `#`, upper-case; anything that is not six hex digits keeps the default `FF0000`.
+    pub color: String,
+    pub weight: i32,
+    pub priority: i32,
+}
+
+impl Default for MapOptions {
+    fn default() -> Self {
+        MapOptions {
+            bluemap: true,
+            dynmap: true,
+            pl3xmap: true,
+            squaremap: true,
+            label: "World Border".into(),
+            hide_by_default: false,
+            color: "FF0000".into(),
+            weight: 3,
+            priority: 0,
+        }
+    }
+}
+
+impl MapOptions {
+    /// The `map-options` block of `config.yml` (`enable:` nested) or the same keys as TOML (`[map-options]`,
+    /// `[map-options.enable]` or flat); keys of other sections are not read. A value that does not parse keeps the default.
+    pub fn parse(text: &str) -> MapOptions {
+        let mut o = MapOptions::default();
+        let mut section: Option<String> = None;
+        for raw in text.lines() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            if let Some(h) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                section = Some(h.trim().to_owned());
+                continue;
+            }
+            let Some((k, v)) = line.split_once('=').or_else(|| line.split_once(':')) else { continue };
+            let (k, mut v) = (k.trim(), v.trim());
+            if !v.starts_with('"') && !v.starts_with('\'') {
+                v = v.split('#').next().unwrap_or("").trim();
+            }
+            let v = v.trim_matches('"').trim_matches('\'');
+            if v.is_empty() {
+                // A YAML header: only a top-level one starts a new section.
+                if !raw.starts_with(char::is_whitespace) {
+                    section = Some(k.to_owned());
+                }
+                continue;
+            }
+            let (key, in_scope) = match k.strip_prefix("map-options.") {
+                Some(rest) => (rest.strip_prefix("enable.").unwrap_or(rest), true),
+                None => (k, section.as_deref().map_or(true, |s| s == "map-options" || s.starts_with("map-options."))),
+            };
+            if !in_scope {
+                continue;
+            }
+            let on = |d: bool| match v.to_ascii_lowercase().as_str() {
+                "true" => true,
+                "false" => false,
+                _ => d,
+            };
+            match key {
+                "bluemap" => o.bluemap = on(o.bluemap),
+                "dynmap" => o.dynmap = on(o.dynmap),
+                "pl3xmap" => o.pl3xmap = on(o.pl3xmap),
+                "squaremap" => o.squaremap = on(o.squaremap),
+                "label" => o.label = v.to_owned(),
+                "hide-by-default" => o.hide_by_default = on(o.hide_by_default),
+                "color" => {
+                    let c = v.trim_start_matches('#');
+                    if c.len() == 6 && c.chars().all(|ch| ch.is_ascii_hexdigit()) {
+                        o.color = c.to_ascii_uppercase();
+                    }
+                }
+                "weight" => o.weight = v.parse().unwrap_or(o.weight),
+                "priority" => o.priority = v.parse().unwrap_or(o.priority),
+                _ => {}
+            }
+        }
+        o
+    }
+
+    /// The `map_options` service reply: `bluemap dynmap pl3xmap squaremap label hide-by-default color weight priority`,
+    /// tab-separated.
+    pub fn fields(&self) -> String {
+        format!(
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            self.bluemap, self.dynmap, self.pl3xmap, self.squaremap, self.label, self.hide_by_default, self.color, self.weight, self.priority
+        )
+    }
+}
+
 /// ChunkyBorder's `config.yml`: the keys under `border-options`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BorderConfig {
@@ -426,6 +529,7 @@ pub struct BorderConfig {
     pub visualizer_enabled: bool,
     pub visualizer_range: i64,
     pub visualizer_color: String,
+    pub map: MapOptions,
 }
 
 impl Default for BorderConfig {
@@ -444,6 +548,7 @@ impl Default for BorderConfig {
             visualizer_enabled: false,
             visualizer_range: 8,
             visualizer_color: "20A0FF".into(),
+            map: MapOptions::default(),
         }
     }
 }
@@ -453,6 +558,7 @@ impl BorderConfig {
     /// keys (`version`, `map-options`) are ignored.
     pub fn parse(text: &str) -> BorderConfig {
         let mut c = BorderConfig::default();
+        c.map = MapOptions::parse(text);
         for line in text.lines() {
             let line = line.trim_start();
             if line.starts_with('#') {
@@ -1070,6 +1176,22 @@ mod tests {
         assert!(!ring.is_empty());
         assert!(ring.iter().all(|p| (p[0].hypot(p[2]) - 100.0).abs() < 1.0), "points sit on the circle");
         assert!(circle.visualizer_points([0.0, 64.0, 0.0], 8.0, 0.0).is_empty());
+    }
+
+    #[test]
+    fn map_options_read_only_their_own_section_and_validate() {
+        let d = MapOptions::default();
+        assert_eq!((d.label.as_str(), d.color.as_str(), d.weight, d.priority, d.hide_by_default), ("World Border", "FF0000", 3, 0, false));
+        let yml = "border-options:\n  message: x\n  visualizer-color: 20A0FF\nmap-options:\n  enable:\n    bluemap: false\n    squaremap: true\n  label: \"Edge\"\n  hide-by-default: true\n  color: '#00ff00' # green\n  weight: 5\n  priority: 7\n";
+        let o = MapOptions::parse(yml);
+        assert_eq!((o.bluemap, o.dynmap, o.pl3xmap, o.squaremap), (false, true, true, true));
+        assert_eq!((o.label.as_str(), o.hide_by_default, o.color.as_str(), o.weight, o.priority), ("Edge", true, "00FF00", 5, 7));
+        assert_eq!(MapOptions::parse("color: nothex\nweight: x\nsquaremap: maybe\n"), d, "bad values keep defaults");
+        assert_eq!(MapOptions::parse("other:\n  label: no\n").label, "World Border", "another section");
+        let t = MapOptions::parse("[map-options]\nlabel = 'Wall'\n[map-options.enable]\ndynmap = false\n");
+        assert_eq!((t.label.as_str(), t.dynmap), ("Wall", false));
+        assert_eq!(o.fields(), "false\ttrue\ttrue\ttrue\tEdge\ttrue\t00FF00\t5\t7");
+        assert_eq!(BorderConfig::parse(yml).map, o);
     }
 
     #[test]
