@@ -67,7 +67,7 @@ Behaviour:
 - [x] 48 spawn of the selected world (round 4)
 - [x] 49 world names in messages as Bukkit names (round 4)
 - [x] 50 custom dimensions (round 4)
-- [ ] 51 live trim (deletes at the next start, not live; `delete_chunks` missing from the pinned SDK)
+- [ ] 51 live trim (round 2: written behind cargo feature `next-engine`, needs `delete_chunks` of branch rec-world-data; default build trims at the next start)
 Config keys (`config.yml`):
 - [n/a] 52 version (Chunky reads it for its own migration; the port has no migration to do)
 - [x] 53 language (round 4)

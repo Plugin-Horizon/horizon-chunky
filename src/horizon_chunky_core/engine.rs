@@ -131,6 +131,28 @@ enum Pending {
     Trim(TrimJob),
 }
 
+/// A trim the server runs while it is up: the chunks still to erase (`level.delete_chunks`), a few per tick.
+struct LiveTrim {
+    world: String,
+    dim: String,
+    todo: VecDeque<Chunk>,
+    /// Chunks that were loaded or held when their turn came, tried again later.
+    deferred: Vec<Chunk>,
+    total: usize,
+    erased: usize,
+    owner: String,
+    next_retry_ms: u64,
+    retries: u32,
+    /// After the first full pass the chunks left over go one per call, so the count says which one stayed.
+    retrying: bool,
+}
+
+/// Chunks one tick hands to the server's `delete_chunks` (its limit is 4096).
+const LIVE_TRIM_BATCH: usize = 512;
+/// How often chunks that were loaded are tried again, and how many rounds before the trim gives up on them.
+const LIVE_TRIM_RETRY_MS: u64 = 5_000;
+const LIVE_TRIM_ROUNDS: u32 = 120;
+
 struct Task {
     sel: Selection,
     run: Run,
@@ -371,6 +393,10 @@ pub struct Engine {
     loaded: HashMap<String, HashSet<Chunk>>,
     /// Lines a background job (`debug map`) finished with, by the sender who asked (empty: console), taken by the glue.
     async_lines: Arc<Mutex<Vec<(String, String)>>>,
+    /// Whether the server can erase chunks while it runs (`delete_chunks`): a confirmed trim then starts at once
+    /// instead of waiting for the next start.
+    live_trim: bool,
+    live_trims: Vec<LiveTrim>,
 }
 
 impl Engine {
@@ -399,7 +425,73 @@ impl Engine {
             last_level_ms: 0,
             loaded: HashMap::new(),
             async_lines: Arc::new(Mutex::new(Vec::new())),
+            live_trim: false,
+            live_trims: Vec::new(),
         }
+    }
+
+    /// The glue says the server can erase chunks while it runs.
+    pub fn set_live_trim(&mut self, on: bool) {
+        self.live_trim = on;
+    }
+
+    /// The next chunks of the live trim of `dim` to erase: up to 512 that are not loaded now (`loaded` is what the
+    /// glue knows of the dimension). Chunks that are loaded wait and come round again every 5 s.
+    pub fn take_live_trim_batch(&mut self, dim: &str, now_ms: u64) -> Vec<Chunk> {
+        let Some(t) = self.live_trims.iter_mut().find(|t| t.dim == dim) else { return Vec::new() };
+        if t.todo.is_empty() && !t.deferred.is_empty() && now_ms >= t.next_retry_ms {
+            t.todo = std::mem::take(&mut t.deferred).into();
+            t.next_retry_ms = now_ms + LIVE_TRIM_RETRY_MS;
+            t.retries += 1;
+            t.retrying = true;
+        }
+        let loaded = self.loaded.get(dim);
+        let mut batch = Vec::new();
+        let size = if t.retrying { 1 } else { LIVE_TRIM_BATCH };
+        while batch.len() < size {
+            let Some(c) = t.todo.pop_front() else { break };
+            if loaded.is_some_and(|l| l.contains(&c)) {
+                if t.deferred.is_empty() && t.next_retry_ms == 0 {
+                    t.next_retry_ms = now_ms + LIVE_TRIM_RETRY_MS;
+                }
+                t.deferred.push(c);
+            } else {
+                batch.push(c);
+            }
+        }
+        batch
+    }
+
+    /// What `delete_chunks` answered for `batch` (None: refused). A shortfall puts the whole batch back (erasing a
+    /// chunk again is harmless); the lines are for the console and the sender who confirmed.
+    pub fn live_trim_done(&mut self, dim: &str, batch: &[Chunk], erased: Option<usize>) {
+        let Some(i) = self.live_trims.iter().position(|t| t.dim == dim) else { return };
+        let t = &mut self.live_trims[i];
+        if erased == Some(batch.len()) {
+            t.erased += batch.len();
+        } else {
+            t.deferred.extend_from_slice(batch);
+        }
+        if !t.todo.is_empty() {
+            return;
+        }
+        let gave_up = t.retries >= LIVE_TRIM_ROUNDS;
+        if !t.deferred.is_empty() && !gave_up {
+            return;
+        }
+        let t = self.live_trims.remove(i);
+        let left = t.deferred.len();
+        let line = if left == 0 {
+            pre(format!("Trim of {} finished: {} of {} chunks erased. Restart the server fully when you are ready.", display_world(&t.world), t.erased, t.total))
+        } else {
+            pre(format!(
+                "Trim of {} stopped: {} of {} chunks erased, {left} stayed loaded or held; run the trim again later.",
+                display_world(&t.world),
+                t.erased,
+                t.total
+            ))
+        };
+        self.async_lines.lock().unwrap_or_else(|e| e.into_inner()).push((t.owner, line));
     }
 
     /// The lines background jobs finished with since the last call: (sender, line), an empty sender being the console.
@@ -538,6 +630,11 @@ impl Engine {
         for (w, t) in &self.tasks {
             self.save(w, false, t);
         }
+    }
+
+    /// Whether a live trim of `dim` still has chunks to erase.
+    pub fn live_trim_active(&self, dim: &str) -> bool {
+        self.live_trims.iter().any(|t| t.dim == dim)
     }
 
     pub fn any_running_in(&self, dim: &str) -> bool {
@@ -1265,7 +1362,9 @@ impl Engine {
     fn cmd_trim(&mut self, rest: &[&str], now_ms: u64) -> Vec<String> {
         if rest.len() == 1 && rest[0].eq_ignore_ascii_case("abort") {
             self.pending.remove(&self.sender);
-            let gone = self.base.as_ref().is_some_and(|b| std::fs::remove_file(b.join(trim::PENDING)).is_ok());
+            let live = !self.live_trims.is_empty();
+            self.live_trims.clear();
+            let gone = self.base.as_ref().is_some_and(|b| std::fs::remove_file(b.join(trim::PENDING)).is_ok()) || live;
             let line = if gone { "[Chunky] The scheduled trim is called off." } else { "[Chunky] No trim is scheduled." };
             return vec![line.into()];
         }
@@ -1321,8 +1420,12 @@ impl Engine {
             p.files_deleted,
             p.files_changed
         )));
-        out.push(pre("This cannot be undone without a backup. It runs at the next server start, before the world loads."));
-        out.push(pre(format!("Type '/chunky confirm' within {} s to schedule it.", CONFIRM_MS / 1000)));
+        out.push(pre(if self.live_trim {
+            "This cannot be undone without a backup. It runs now, a few chunks per tick."
+        } else {
+            "This cannot be undone without a backup. It runs at the next server start, before the world loads."
+        }));
+        out.push(pre(format!("Type '/chunky confirm' within {} s to {} it.", CONFIRM_MS / 1000, if self.live_trim { "start" } else { "schedule" })));
         out.extend(p.errors.iter().map(|e| pre(format!("Could not read {e}"))));
         self.pending.insert(self.sender.clone(), (Pending::Trim(job), now_ms + CONFIRM_MS));
         out
@@ -1340,7 +1443,40 @@ impl Engine {
         }
     }
 
+    /// A confirmed trim on a server that erases chunks while it runs: the chunks go a few per tick.
+    fn start_live_trim(&mut self, job: TrimJob) -> Vec<String> {
+        let dim = dimension_of(&job.world).to_owned();
+        if self.live_trims.iter().any(|t| t.dim == dim) {
+            return vec![pre(format!("A trim of {} is already running. '/chunky trim abort' stops it.", display_world(&job.world)))];
+        }
+        let todo: VecDeque<Chunk> = job.doomed().into();
+        let total = todo.len();
+        let line = pre(format!(
+            "Trim of {} started: {total} saved chunks are erased, a few per tick; chunks that are loaded wait until they unload.",
+            display_world(&job.world)
+        ));
+        if total == 0 {
+            return vec![pre(format!("Nothing to trim in {}.", display_world(&job.world)))];
+        }
+        self.live_trims.push(LiveTrim {
+            world: job.world,
+            dim,
+            todo,
+            deferred: Vec::new(),
+            total,
+            erased: 0,
+            owner: self.sender.clone(),
+            next_retry_ms: 0,
+            retries: 0,
+            retrying: false,
+        });
+        vec![line]
+    }
+
     fn schedule_trim(&mut self, job: TrimJob) -> Vec<String> {
+        if self.live_trim {
+            return self.start_live_trim(job);
+        }
         let Some(base) = self.base.clone() else { return vec![pre("The config folder is not known yet.")] };
         let _ = std::fs::create_dir_all(&base);
         match std::fs::write(base.join(trim::PENDING), trim::render(&job)) {
@@ -2018,6 +2154,38 @@ mod tests {
         assert!(e.command("chunky trim abort", &who, 0)[0].contains("called off"));
         assert!(!base.join(trim::PENDING).exists());
         assert!(e.command("chunky trim world square 0 0 16 16 sideways", &who, 0)[0].contains("chunky trim"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_live_trim_erases_in_batches_and_waits_for_loaded_chunks() {
+        let d = world_with_region("livetrim", &[(0, "minecraft:full"), (500, "minecraft:full"), (501, "minecraft:full")]);
+        let mut e = engine(None);
+        e.set_base(d.join("config/chunky"));
+        e.set_world_dir(Some(d.clone()));
+        e.set_live_trim(true);
+        let who = Who::default();
+        let r = e.command("chunky trim world square 0 0 16 16 outside", &who, 0);
+        assert!(r.iter().any(|l| l.contains("runs now")), "{r:?}");
+        assert!(e.command("chunky confirm", &who, 1000)[0].contains("started: 2 saved chunks"));
+        assert!(!d.join("config/chunky").join(trim::PENDING).exists(), "a live trim writes no pending file");
+        e.chunk_loaded("minecraft:overworld", (20, 15));
+        let batch = e.take_live_trim_batch("minecraft:overworld", 2000);
+        assert_eq!(batch.len(), 1, "the loaded chunk waits");
+        e.live_trim_done("minecraft:overworld", &batch, Some(1));
+        assert!(e.take_async().is_empty());
+        assert!(e.take_live_trim_batch("minecraft:overworld", 3000).is_empty(), "retry only after 5 s");
+        e.chunk_unloaded("minecraft:overworld", (20, 15));
+        let again = e.take_live_trim_batch("minecraft:overworld", 8000);
+        assert_eq!(again, [(20, 15)]);
+        // The server erased fewer than it was given: the batch comes back.
+        e.live_trim_done("minecraft:overworld", &again, Some(0));
+        assert!(e.take_async().is_empty());
+        let third = e.take_live_trim_batch("minecraft:overworld", 20_000);
+        e.live_trim_done("minecraft:overworld", &third, Some(1));
+        let lines = e.take_async();
+        assert!(lines[0].1.contains("finished: 2 of 2 chunks erased"), "{lines:?}");
+        assert!(e.take_live_trim_batch("minecraft:overworld", 30_000).is_empty());
         let _ = std::fs::remove_dir_all(d);
     }
 

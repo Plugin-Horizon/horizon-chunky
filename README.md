@@ -95,10 +95,11 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
-What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
+What does not work yet:
 
 - `start` checks `radius-limit` from `config/chunky/.chunky.properties`; Chunky's disk-space message is not ported (the original never prints it).
-- The `border` subcommands (the ChunkyBorder add-on) are not ported; trim runs at the next server start, not live.
-- Live trim (needs `LevelRef::delete_chunks`) and the aggregate node `chunky.chunky` (needs permission children) wait on engine APIs; see audit/rec100/ENGINE_NEEDS.md.
+- The `border` subcommands (the ChunkyBorder add-on) are not ported (add-on not installed).
+- Live trim needs `LevelRef::delete_chunks`, which is on the engine branch `rec-world-data` and not yet in the SDK: with the cargo feature `next-engine` a confirmed trim erases chunks a few per tick while the server runs (chunks that are loaded or held wait and are retried every 5 s); without it a confirmed trim is written to `trim-pending.properties` and applied at the next start, as before.
+- The aggregate node `chunky.chunky` (default nobody, children: the root and every subcommand node but trim) and the `children: [chunky.command]` of each subcommand node follow plugin.yml (`add_with_children`).
 - A Java `config.yml` copied into `config/chunky/` is read when `config.toml` is absent (same keys).
 - Messages are translated by matching each printed line against `lang/en.json` (see `src/horizon_chunky_core/lang.rs`); a line whose wording differs from that file is printed in English.

@@ -427,12 +427,19 @@ impl Hooks for Mod {
     }
 
     fn permission_gather_nodes(&self, event: &mut PermissionGatherNodesEvent<'_>) {
-        // The root node and one per subcommand, each defaulting to operator level 2 (`LEVEL`).
-        let level = PermissionLevel::from_level(i32::from(LEVEL));
-        let names = std::iter::once(ROOT_NODE.to_string()).chain(SUBS.iter().map(|s| format!("chunky.command.{s}")));
-        for name in names {
-            let _ = event.nodes.add(typed(&name), NodeDefault::Level(level));
+        // plugin.yml: the root node and one per subcommand, each defaulting to operator level 2 (`LEVEL`); holding a
+        // subcommand's node grants the root (`children: [chunky.command]`).
+        let level = NodeDefault::Level(PermissionLevel::from_level(i32::from(LEVEL)));
+        let _ = event.nodes.add(typed(ROOT_NODE), level.clone());
+        for sub in SUBS {
+            let _ = event.nodes.add_with_children(typed(&format!("chunky.command.{sub}")), level.clone(), &[typed(ROOT_NODE)]);
         }
+        // `chunky.chunky` (default: nobody) grants the root and every subcommand node but trim (plugin.yml).
+        let children: Vec<PermissionNode> = std::iter::once(ROOT_NODE.to_string())
+            .chain(SUBS.iter().filter(|s| **s != "trim").map(|s| format!("chunky.command.{s}")))
+            .map(|n| typed(&n))
+            .collect();
+        let _ = event.nodes.add_with_children(typed("chunky.chunky"), NodeDefault::Nobody, &children);
     }
 
     fn register_commands(&self, _: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
@@ -594,6 +601,9 @@ impl Hooks for Mod {
         for l in chunky::init_once(config, Some(world_dir)) {
             log(&l);
         }
+        // With `delete_chunks` a confirmed trim starts at once instead of at the next start.
+        #[cfg(feature = "next-engine")]
+        chunky::with(|e| e.set_live_trim(true));
         if disable_pause_when_empty() {
             log(&chunky::lang::tr("error_pause_when_empty_seconds", &[]));
         }
@@ -614,6 +624,12 @@ impl Hooks for Mod {
         let dim = level.dimension_id();
         register_dimension(dim);
         self.sweep_once(host, level, dim, controller);
+        // A trim that runs while the server is up (`next-engine`): the chunks go a few per tick.
+        if chunky::with(|e| e.live_trim_active(dim)) {
+            self.diff_loaded(&*host, level, dim);
+            #[cfg(feature = "next-engine")]
+            self.live_trim_step(host, level, dim);
+        }
         // Lines a background job (`debug map`) finished with, for whoever asked.
         for (sender, line) in chunky::with(|e| e.take_async()) {
             if sender.is_empty() {
@@ -687,6 +703,18 @@ impl Mod {
                 "released {count} chunk ticket(s) an earlier run left in {dim}"
             ));
         }
+    }
+
+    /// Erases the next chunks of the dimension's live trim. Needs `LevelRef::delete_chunks`, which is on the engine
+    /// branch `rec-world-data` and not yet in the SDK (feature `next-engine`).
+    #[cfg(feature = "next-engine")]
+    fn live_trim_step(&self, host: &mut dyn ServerHost, level: LevelRef, dim: &str) {
+        let batch = chunky::with(|e| e.take_live_trim_batch(dim, chunky::now_ms()));
+        if batch.is_empty() {
+            return;
+        }
+        let erased = level.delete_chunks(host, &batch);
+        chunky::with(|e| e.live_trim_done(dim, &batch, erased));
     }
 
     /// Tells the engine which chunks came and went since the last tick (its `chunk_load` and `chunk_unload`).
