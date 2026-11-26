@@ -82,7 +82,7 @@ Messages:
 - [x] 61 translated words in messages (shape, pattern, enabled, disabled; time units in the unmodified notice)
 - [x] 62 permission text for a player without the node (hidden command, round 3)
 - [x] 63 the console lines (task progress, task stopped, gave up waiting)
-Counted (round 5): 25 of 27 done in audit/rec100/chunky.md (border system, API service and visualizer added; 2 [E]: squaremap marker layer, end gateway redirect); 2 n/a stay (disk estimate: removed; dynmap/BlueMap/Pl3xMap: java-only). Before: 60 items (59 done, 1 open: live trim; 3 n/a: items 25, 41, 52). Port-only, not counted: deferred trim with its preview lines, tick budget and ticket keys in config.toml, `chunky trim abort`.
+Counted (round 5): 25 of 27 done in audit/rec100/chunky.md (border system, API service and visualizer added); round 8: 28 of 28 (squaremap marker layer drawn by the squaremap mod, end gateway exit moved inside through the writable landing); 2 n/a stay (disk estimate: removed; dynmap/BlueMap/Pl3xMap: java-only). Before: 60 items (59 done, 1 open: live trim; 3 n/a: items 25, 41, 52). Port-only, not counted: deferred trim with its preview lines, tick budget and ticket keys in config.toml, `chunky trim abort`.
 
 Round 3 (blind, no compile)
 - Fixed: colours. Messages carry Chunky's `&` codes (help usage green, `&aChunky Commands&r`, trim warning `&c`, trim notices `&e`, world-border notice `&e`, debug failure `&c`); `lib.rs` `legacy_text` turns them into styled text (`#RRGGBB` colour per code), the console log strips them.

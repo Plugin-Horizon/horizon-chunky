@@ -796,24 +796,12 @@ impl Hooks for Mod {
         self.pull_in(host, player, &mut *event.target, prevent, RedirectKind::Teleport)
     }
 
-    /// An end gateway whose exit lies outside the border: cancelled with `prevent-end-gateway`. The exit cannot be
-    /// moved inside (the landing is read-only), so without the option the player lands where the gateway says.
+    /// An end gateway whose exit lies outside the border: cancelled with `prevent-end-gateway`, otherwise the exit
+    /// moves inside the border (ChunkyBorder's `e.setTo`), like an ender pearl.
     fn player_teleport_end_gateway_detail(&self, host: &mut dyn ServerHost, event: &mut PlayerTeleportEndGatewayDetailEvent<'_>) -> Flow {
-        if !chunky::with(|e| e.borders.config.prevent_end_gateway) {
-            return Flow::Continue;
-        }
         let Some(player) = host.player(event.player) else { return Flow::Continue };
-        let Some((world, _)) = player_world(&*host, player) else { return Flow::Continue };
-        let landing = event.landing;
-        if chunky::with(|e| e.borders.inside(world, landing[0], landing[2])) {
-            return Flow::Continue;
-        }
-        let bypass = player.permission_bool(host, &typed(BYPASS_MOVE)).unwrap_or(false);
-        if bypass || chunky::with(|e| e.borders.is_bypassing(event.player)) {
-            Flow::Continue
-        } else {
-            Flow::Cancel
-        }
+        let prevent = chunky::with(|e| e.borders.config.prevent_end_gateway);
+        self.pull_in(host, player, &mut *event.landing, prevent, RedirectKind::Teleport)
     }
 
     /// `PlayerRespawnEvent`: a respawn outside the border moves inside it.

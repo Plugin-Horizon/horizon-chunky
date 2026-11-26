@@ -117,7 +117,7 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 What does not work yet:
 
 - The disk-space message (`format_start_disk`) is not ported: the original defines it but no command prints it. `start` checks `radius-limit` from `config/chunky/.chunky.properties`.
-- Border: the squaremap marker layer needs the squaremap mod to subscribe to the border events (dynmap, BlueMap and Pl3xMap markers are Java-only). An end gateway whose exit lies outside the border is cancelled with `prevent-end-gateway` but cannot be moved inside (the landing is read-only: ENGINE_NEEDS `player_teleport_end_gateway_landing_mut`). The visualizer's dust goes to everyone in range, not only to the player it is drawn for; the border effect `ender_signal` is drawn as portal particles.
+- Border: the squaremap mod draws the marker layer from the border events (dynmap, BlueMap and Pl3xMap markers are Java-only). An end gateway whose exit lies outside the border is cancelled with `prevent-end-gateway`, otherwise the exit is moved inside (the hook's writable `landing`). The visualizer's dust goes to everyone in range, not only to the player it is drawn for; the border effect `ender_signal` is drawn as portal particles.
 - Live trim runs while the server is up (`LevelRef::delete_chunks`): a confirmed trim erases chunks a few per tick; chunks that are loaded or held wait and are retried every 5 s.
 - The aggregate node `chunky.chunky` (default nobody, children: the root and every subcommand node but trim and border) and the `children: [chunky.command]` of each subcommand node follow plugin.yml (`add_with_children`).
 - A Java `config.yml` copied into `config/chunky/` is read when `config.toml` is absent (same keys; its `version` key is ignored).
