@@ -270,27 +270,10 @@ fn usages() -> Vec<String> {
         "chunky silent",
         "chunky selection",
         "chunky quiet <interval:integer>",
-        "chunky limit <rate:integer>",
-        "chunky debug",
-        "chunky debug map",
         "chunky reload",
         "chunky reload config",
         "chunky reload tasks",
-        "chunky border",
-        "chunky border help",
-        "chunky border list",
-        "chunky border add",
-        "chunky border add <world:chunky:world>",
-        "chunky border bypass",
-        "chunky border bypass <player:word>",
-        "chunky border load",
-        "chunky border load <world:chunky:world>",
-        "chunky border remove",
-        "chunky border remove <world:chunky:world>",
-        "chunky border wrap",
-        "chunky border wrap <wrap:chunky:wrap>",
         "chunky trim",
-        "chunky trim abort",
         "chunky trim <world:chunky:world>",
         "chunky confirm",
         "chunky pattern csv",
@@ -309,9 +292,8 @@ fn usages() -> Vec<String> {
     usages.push(
         "chunky start <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]".into(),
     );
-    usages.push(
-        "chunky border add <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]".into(),
-    );
+    // `border`, `limit` and `debug` work but Paper's tab completion never lists them: one hidden word takes them.
+    usages.push("chunky <hidden:chunky:hidden> [rest:text]".into());
     usages
         .push("chunky trim <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]".into());
     usages.push(
@@ -379,6 +361,30 @@ impl CommandArgumentType for Words {
             .filter(|w| w.to_ascii_lowercase().starts_with(&prefix))
             .map(CommandSuggestion::new)
             .collect()
+    }
+}
+
+/// The subcommands that work but are not completed (Paper's Chunky does not list the border's, `limit` or `debug`).
+const HIDDEN_SUBS: [&str; 3] = ["border", "debug", "limit"];
+
+/// A first word that never completes and accepts only [`HIDDEN_SUBS`]; the engine takes the rest of the line.
+struct Hidden;
+
+impl CommandArgumentType for Hidden {
+    fn kind(&self) -> CommandArgumentKind {
+        CommandArgumentKind::Word
+    }
+
+    fn parse(&self, input: &str) -> Result<String, CommandArgumentError> {
+        HIDDEN_SUBS
+            .iter()
+            .find(|s| s.eq_ignore_ascii_case(input))
+            .map(|s| (*s).to_owned())
+            .ok_or_else(|| CommandArgumentError::new(Text::literal("not a hidden subcommand")))
+    }
+
+    fn suggest(&self, _: Option<&CommandSender>, _: &str) -> Vec<CommandSuggestion> {
+        Vec::new()
     }
 }
 
@@ -474,6 +480,7 @@ impl Hooks for Mod {
         r.register_command_argument("shape", Words(shape_words));
         r.register_command_argument("side", Words(side_words));
         r.register_command_argument("filters", Filters);
+        r.register_command_argument("hidden", Hidden);
         r.register_command_argument("wrap", Words(wrap_words));
         // The border's effect and visualizer particles.
         let mut particles = lock(&self.particles);
@@ -1142,15 +1149,29 @@ mod tree_tests {
     use super::*;
 
     #[test]
+    fn border_limit_debug_and_trim_abort_work_but_are_not_suggested() {
+        let usages = usages();
+        for hidden in ["chunky border", "chunky limit", "chunky debug", "chunky trim abort"] {
+            assert!(!usages.iter().any(|u| u == hidden || u.starts_with(&format!("{hidden} "))), "{hidden}");
+        }
+        assert!(usages.iter().any(|u| u == "chunky <hidden:chunky:hidden> [rest:text]"));
+        for sub in HIDDEN_SUBS {
+            assert_eq!(Hidden.parse(&sub.to_ascii_uppercase()).as_deref(), Ok(sub));
+        }
+        assert!(Hidden.parse("start").is_err());
+        assert!(Hidden.suggest(None, "").is_empty());
+        // `trim abort` is a world word that the engine reads.
+        assert!(Words(world_words).parse("abort").is_ok());
+    }
+
+    #[test]
     fn the_sub_commands_of_the_original_are_in_the_tree() {
         let usages = usages();
-        for sub in SUBS {
+        for sub in SUBS.iter().filter(|s| !HIDDEN_SUBS.contains(s)) {
             assert!(usages.iter().any(|u| u == &format!("chunky {sub}") || u.starts_with(&format!("chunky {sub} "))), "chunky {sub}");
         }
         for want in [
             "chunky start <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]",
-            "chunky border add <world:chunky:world>",
-            "chunky border wrap <wrap:chunky:wrap>",
             "chunky corners <x1:word> <z1:word> <x2:word> <z2:word>",
             "chunky pattern concentric",
             "chunky shape circle",
