@@ -1138,6 +1138,29 @@ impl Mod {
 }
 
 #[cfg(test)]
+mod tree_tests {
+    use super::*;
+
+    #[test]
+    fn the_sub_commands_of_the_original_are_in_the_tree() {
+        let usages = usages();
+        for sub in SUBS {
+            assert!(usages.iter().any(|u| u == &format!("chunky {sub}") || u.starts_with(&format!("chunky {sub} "))), "chunky {sub}");
+        }
+        for want in [
+            "chunky start <world:chunky:world> <shape:chunky:shape> [x:word] [z:word] [rx:word] [rz:word]",
+            "chunky border add <world:chunky:world>",
+            "chunky border wrap <wrap:chunky:wrap>",
+            "chunky corners <x1:word> <z1:word> <x2:word> <z2:word>",
+            "chunky pattern concentric",
+            "chunky shape circle",
+        ] {
+            assert!(usages.iter().any(|u| u == want), "{want}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
