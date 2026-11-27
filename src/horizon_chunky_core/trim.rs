@@ -108,6 +108,18 @@ impl TrimJob {
         rep
     }
 
+    /// The saved chunks `apply` deletes, as chunk coordinates (the inhabited and unmodified filters read as `apply`
+    /// reads them). For a live trim, where the server erases them.
+    pub fn doomed(&self) -> Vec<(i32, i32)> {
+        let mut out = Vec::new();
+        for (r, p) in region::region_files(&self.dir, "region") {
+            let Ok(existing) = region::existing_in(&p, r) else { continue };
+            let del = self.decide(r);
+            out.extend(existing.into_iter().filter(|c| del[region::index_of(*c)]));
+        }
+        out
+    }
+
     /// Deletes the chunks. Only call it while no server has the world open.
     pub fn apply(&self) -> TrimReport {
         let mut rep = TrimReport::default();
@@ -321,6 +333,17 @@ mod tests {
         assert!(region::is_full(&region::read_record(&mut f, loc[1]).unwrap()).unwrap());
         // A second run finds nothing more to do.
         assert_eq!(j.apply().chunks_deleted, 0);
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn doomed_lists_the_chunks_apply_would_delete() {
+        let d = tmp("doomed");
+        world(&d);
+        let mut got = job(d.clone(), false, None).doomed();
+        got.sort();
+        assert_eq!(got, vec![(5, 5), (96, 96)]);
+        assert_eq!(job(d.clone(), false, None).apply().chunks_deleted, 2);
         let _ = std::fs::remove_dir_all(d);
     }
 

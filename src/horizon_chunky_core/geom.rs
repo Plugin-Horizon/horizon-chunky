@@ -207,6 +207,57 @@ fn inside_polygon(p: &[(f64, f64)], c: (f64, f64)) -> bool {
     (0..p.len()).all(|i| inside_line(p[i], p[(i + 1) % p.len()], c))
 }
 
+/// Chunky's `ShapeUtil.intersection`: where the line through `a1`, `a2` meets the line through `b1`, `b2`.
+pub fn line_intersection(a1: (f64, f64), a2: (f64, f64), b1: (f64, f64), b2: (f64, f64)) -> Option<(f64, f64)> {
+    let (ca, cb) = (a2.1 - a1.1, b2.1 - b1.1);
+    let (da, db) = (a1.0 - a2.0, b1.0 - b2.0);
+    let det = ca * db - cb * da;
+    if det == 0.0 {
+        return None;
+    }
+    let c1 = ca * a1.0 + da * a1.1;
+    let c2 = cb * b1.0 + db * b1.1;
+    Some(((db * c1 - da * c2) / det, (ca * c2 - cb * c1) / det))
+}
+
+/// Whether `(px, pz)` lies in the shape around `(ax, az)` with half-sizes `rx` and `rz`: Chunky's `isBounding`.
+fn shape_contains(shape: Shape, (ax, az, rx, rz): (f64, f64, f64, f64), px: f64, pz: f64) -> bool {
+    let (dx, dz) = (px - ax, pz - az);
+    match shape {
+        Shape::Square => dx >= -rx && dx <= rx && dz >= -rx && dz <= rx,
+        Shape::Rectangle => dx >= -rx && dx <= rx && dz >= -rz && dz <= rz,
+        Shape::Circle => (ax - px).hypot(az - pz) <= rx,
+        Shape::Ellipse => dx * dx / (rx * rx) + dz * dz / (rz * rz) <= 1.0,
+        Shape::Diamond => {
+            let p = [(ax, az + rx), (ax - rx, az), (ax, az - rx), (ax + rx, az)];
+            inside_polygon(&p, (px, pz))
+        }
+        Shape::Triangle => {
+            let p = [(ax + rx, az + rx), (ax - rx, az + rx), (ax, az - rx)];
+            inside_polygon(&p, (px, pz))
+        }
+        Shape::Pentagon => {
+            let p = corners(ax, az, rx, &[54.0, 126.0, 198.0, 270.0, 342.0]);
+            inside_polygon(&p, (px, pz))
+        }
+        Shape::Hexagon => {
+            let p = corners(ax, az, rx, &[60.0, 120.0, 180.0, 240.0, 300.0, 360.0]);
+            inside_polygon(&p, (px, pz))
+        }
+        Shape::Star => {
+            let p = corners(ax, az, rx, &[54.0, 126.0, 198.0, 270.0, 342.0]);
+            let c = (px, pz);
+            let i = |a: usize, b: usize| inside_line(p[a], p[b], c);
+            let (i13, i24, i35, i41, i52) = (i(0, 2), i(1, 3), i(2, 4), i(3, 0), i(4, 1));
+            (i13 && i24 && i35 && i41)
+                || (i24 && i35 && i41 && i52)
+                || (i35 && i41 && i52 && i13)
+                || (i41 && i52 && i13 && i24)
+                || (i52 && i13 && i24 && i35)
+        }
+    }
+}
+
 impl Selection {
     /// The chunk radii along x and z: `ceil(radius / 16)`, as Chunky's `radiusChunksX` and `radiusChunksZ`.
     pub fn chunk_radii(&self) -> (i32, i32) {
@@ -232,41 +283,44 @@ impl Selection {
     /// Whether the chunk is selected: its centre lies in the shape (Chunky's `isBounding` on the chunk centre).
     pub fn contains(&self, c: Chunk) -> bool {
         let (ax, az, rx, rz) = self.aligned();
-        let px = f64::from(c.0) * 16.0 + 8.0;
-        let pz = f64::from(c.1) * 16.0 + 8.0;
-        let (dx, dz) = (px - ax, pz - az);
-        match self.shape {
-            Shape::Square => dx >= -rx && dx <= rx && dz >= -rx && dz <= rx,
-            Shape::Rectangle => dx >= -rx && dx <= rx && dz >= -rz && dz <= rz,
-            Shape::Circle => (ax - px).hypot(az - pz) <= rx,
-            Shape::Ellipse => dx * dx / (rx * rx) + dz * dz / (rz * rz) <= 1.0,
-            Shape::Diamond => {
-                let p = [(ax, az + rx), (ax - rx, az), (ax, az - rx), (ax + rx, az)];
-                inside_polygon(&p, (px, pz))
-            }
-            Shape::Triangle => {
-                let p = [(ax + rx, az + rx), (ax - rx, az + rx), (ax, az - rx)];
-                inside_polygon(&p, (px, pz))
-            }
-            Shape::Pentagon => {
-                let p = corners(ax, az, rx, &[54.0, 126.0, 198.0, 270.0, 342.0]);
-                inside_polygon(&p, (px, pz))
-            }
-            Shape::Hexagon => {
-                let p = corners(ax, az, rx, &[60.0, 120.0, 180.0, 240.0, 300.0, 360.0]);
-                inside_polygon(&p, (px, pz))
-            }
+        shape_contains(self.shape, (ax, az, rx, rz), f64::from(c.0) * 16.0 + 8.0, f64::from(c.1) * 16.0 + 8.0)
+    }
+
+    /// Whether the block position lies in the shape as it is (not chunk aligned), as `isBounding` of a shape
+    /// built with `chunkAligned` off: ChunkyBorder's `BorderData.getBorder`.
+    pub fn contains_point(&self, x: f64, z: f64) -> bool {
+        shape_contains(self.shape, (self.cx, self.cz, self.radius, self.radius_z), x, z)
+    }
+
+    /// The corners of a polygon shape as it is (not chunk aligned), in Chunky's order (`AbstractPolygon.points`);
+    /// None for the circle and the ellipse.
+    pub fn polygon_points(&self) -> Option<Vec<(f64, f64)>> {
+        let (ax, az, rx, rz) = (self.cx, self.cz, self.radius, self.radius_z);
+        Some(match self.shape {
+            Shape::Square => vec![(ax + rx, az - rx), (ax - rx, az - rx), (ax - rx, az + rx), (ax + rx, az + rx)],
+            Shape::Rectangle => vec![(ax + rx, az - rz), (ax - rx, az - rz), (ax - rx, az + rz), (ax + rx, az + rz)],
+            Shape::Diamond => vec![(ax, az + rx), (ax - rx, az), (ax, az - rx), (ax + rx, az)],
+            Shape::Triangle => vec![(ax + rx, az + rx), (ax - rx, az + rx), (ax, az - rx)],
+            Shape::Pentagon => corners(ax, az, rx, &[54.0, 126.0, 198.0, 270.0, 342.0]),
+            Shape::Hexagon => corners(ax, az, rx, &[60.0, 120.0, 180.0, 240.0, 300.0, 360.0]),
             Shape::Star => {
                 let p = corners(ax, az, rx, &[54.0, 126.0, 198.0, 270.0, 342.0]);
-                let c = (px, pz);
-                let i = |a: usize, b: usize| inside_line(p[a], p[b], c);
-                let (i13, i24, i35, i41, i52) = (i(0, 2), i(1, 3), i(2, 4), i(3, 0), i(4, 1));
-                (i13 && i24 && i35 && i41)
-                    || (i24 && i35 && i41 && i52)
-                    || (i35 && i41 && i52 && i13)
-                    || (i41 && i52 && i13 && i24)
-                    || (i52 && i13 && i24 && i35)
+                let at = |a: usize, b: usize, c: usize, d: usize, fallback: usize| {
+                    line_intersection(p[a], p[b], p[c], p[d]).unwrap_or(p[fallback])
+                };
+                let i = [at(0, 2, 1, 4, 0), at(0, 2, 1, 3, 1), at(1, 3, 2, 4, 2), at(2, 4, 0, 3, 3), at(0, 3, 1, 4, 4)];
+                (0..5).flat_map(|k| [p[k], i[k]]).collect()
             }
+            Shape::Circle | Shape::Ellipse => return None,
+        })
+    }
+
+    /// The radii of the circle and the ellipse (`AbstractEllipse.radii`); None for the polygons.
+    pub fn ellipse_radii(&self) -> Option<(f64, f64)> {
+        match self.shape {
+            Shape::Circle => Some((self.radius, self.radius)),
+            Shape::Ellipse => Some((self.radius, self.radius_z)),
+            _ => None,
         }
     }
 

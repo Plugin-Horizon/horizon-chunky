@@ -2,7 +2,7 @@
 
 ## Port status
 
-Compared with Chunky b8431a9 (pop4959): **98 %** of the original's commands, permissions, config keys, messages and features work today; **98 %** once our open Horizon PRs are merged; **98 %** with the engine changes we are writing; **98 %** with the newest Horizon SDK. Counted on 59/60 items (see HMOD_PORT.md). Status: not yet compiled after the 2026-11-20 round.
+Compared with Chunky b8431a9 (pop4959): **93 %** of the original's commands, permissions, config keys, messages and features work today; **93 %** once our open Horizon PRs are merged; **93 %** with the engine changes we are writing; **93 %** with the newest Horizon SDK. Counted on 26/28 items (see audit item list; the 2 open ones are engine follow-ups). Status: not yet compiled after the 2026-11-20 round.
 
 > **Unofficial Rust port of Chunky for the Horizon server (https://github.com/arismoko/horizon). Not affiliated with or endorsed by the Chunky authors.**
 
@@ -44,7 +44,26 @@ one or two; the side word of `trim` comes after both radii. `cancel`, `start` ov
 `limit <rate>` caps a task at that many chunks per second (0 for none; saved with the task). A player who starts or continues a task is told when it finishes, and `confirm` is kept per sender. Tab completion offers world (custom dimensions too), shape, pattern, trim-side and trim-filter words.
 
 `debug map` writes `config/chunky/debug/<world>.png`. Trim filters: `inhabited=<min>..<max>` and `unmodified=<amount><unit>`.
-Not ported: the `border` subcommands (ChunkyBorder is not on Horizon). See the Known gaps section.
+
+### Border (ChunkyBorder)
+
+`chunky border <add|remove|wrap|list|load|bypass|help>` is ChunkyBorder's command (GPL-3.0, pop4959/ChunkyBorder), node
+`chunky.command.border`. `add [world] [shape] [x z] [radius] [z radius]` reads the words as `start` does and writes the
+selection; `load [world]` copies a border into the selection; `wrap [none|default|both|radial|x|z|earth]` sets what
+happens at the edge. Borders are kept in `config/chunkyborder/borders.json` (Gson's layout, so the Java file can be
+copied in), the options in `config/chunkyborder/config.yml` or `config.toml` (`border-options` keys: `check-interval`,
+`message`, `use-action-bar`, `effect`, `sound`, `prevent-mob-spawns`, `-enderpearl`, `-chorus-fruit`, `-end-gateway`,
+`-trident`, `visualizer-enabled`, `-range`, `-color`). Players outside a border are sent back (or wrapped) every
+`check-interval` ticks; nodes `chunkyborder.bypass.move`, `.place`, `.break` (default nobody) or `border bypass` let one through.
+
+### API for other mods
+
+`chunky:api` is a mod service (`host.commands().call_mod_service("chunky:api", bytes)`): one tab-separated line in, one
+text line out. Chunky's calls: `version`, `is_running <world>`, `start_task <world> <shape> <x> <z> <rx> <rz> <pattern>`,
+`pause_task`, `continue_task`, `cancel_task`; ChunkyBorder's: `border_get`, `border_add`, `border_remove`,
+`border_set_wrap`, `border_inside`, `border_is_bypassing`, `border_set_bypassing`. `subscribe <mod id>` makes Chunky
+call `<mod id>:chunky_event` with `generation_start`, `generation_progress`, `generation_complete`, `border_change` or
+`border_redirect` lines (fields in the order of the Java records). The layout is in `src/horizon_chunky_core/api.rs`.
 
 ## Shapes and patterns
 
@@ -95,8 +114,11 @@ horizon-launcher native-build <path to this folder> --server-output <dir> --vers
 
 ## Known gaps
 
-What does not work yet on arismoko/horizon (each is marked `TODO(arismoko-api: ...)` in `src/lib.rs`):
+What does not work yet:
 
-- `start` checks `radius-limit` from `config/chunky/.chunky.properties`; Chunky's disk-space message is not ported (the original never prints it).
-- The `border` subcommands (the ChunkyBorder add-on) are not ported; trim runs at the next server start, not live.
+- The disk-space message (`format_start_disk`) is not ported: the original defines it but no command prints it. `start` checks `radius-limit` from `config/chunky/.chunky.properties`.
+- Border: the squaremap mod draws the marker layer from the border events (dynmap, BlueMap and Pl3xMap markers are Java-only). An end gateway whose exit lies outside the border is cancelled with `prevent-end-gateway`, otherwise the exit is moved inside (the hook's writable `landing`). The visualizer's dust goes to everyone in range, not only to the player it is drawn for; the border effect `ender_signal` is drawn as portal particles.
+- Live trim runs while the server is up (`LevelRef::delete_chunks`): a confirmed trim erases chunks a few per tick; chunks that are loaded or held wait and are retried every 5 s.
+- The aggregate node `chunky.chunky` (default nobody, children: the root and every subcommand node but trim and border) and the `children: [chunky.command]` of each subcommand node follow plugin.yml (`add_with_children`).
+- A Java `config.yml` copied into `config/chunky/` is read when `config.toml` is absent (same keys; its `version` key is ignored).
 - Messages are translated by matching each printed line against `lang/en.json` (see `src/horizon_chunky_core/lang.rs`); a line whose wording differs from that file is printed in English.
