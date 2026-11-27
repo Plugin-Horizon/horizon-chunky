@@ -1,6 +1,8 @@
 //! Chunky for Horizon: pre-generation tasks as a pure state machine.
 //! The mod's helpers feed it commands, ticks and chunk loads and apply the chunk tickets it asks for.
 
+pub mod api;
+pub mod border;
 pub mod engine;
 pub mod genmap;
 pub mod geom;
@@ -56,11 +58,12 @@ pub fn init_once(config_dir: &Path, world_dir: Option<std::path::PathBuf>) -> Ve
         return Vec::new();
     }
     let base = config_dir.join("chunky");
-    let cfg = std::fs::read_to_string(base.join("config.toml")).map(|t| Config::parse(&t)).unwrap_or_default();
+    let cfg = engine::read_config(&base);
     lang::set_language(&cfg.language);
     with(|e| {
         e.cfg = cfg;
         e.set_base(base);
+        e.set_border_dir(&config_dir.join("chunkyborder"));
         e.load_tasks()
     })
 }

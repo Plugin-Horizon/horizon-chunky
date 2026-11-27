@@ -1,6 +1,8 @@
 //! Tasks, commands and the per-tick work, without any game types so it can be tested.
 
 use crate::horizon_chunky_core::genmap;
+use super::border::{BorderData, Borders, Wrap};
+use super::api;
 use crate::horizon_chunky_core::lang::tr;
 use crate::horizon_chunky_core::geom::{self, Chunk, ChunkList, Pattern, Selection, Shape};
 use crate::horizon_chunky_core::region::{self, ExistingIndex};
@@ -54,13 +56,21 @@ impl Default for Config {
     }
 }
 
+/// `config.toml`, else the Java server's `config.yml` copied into the same folder.
+pub fn read_config(base: &std::path::Path) -> Config {
+    let text = std::fs::read_to_string(base.join("config.toml")).or_else(|_| std::fs::read_to_string(base.join("config.yml")));
+    text.map(|t| Config::parse(&t)).unwrap_or_default()
+}
+
 impl Config {
-    /// Reads the TOML subset the mod's config uses (`key = value` lines); unknown keys are ignored.
+    /// Reads the TOML subset the mod's config uses (`key = value` lines) or a Chunky `config.yml` (`key: value`);
+    /// unknown keys are ignored.
     pub fn parse(text: &str) -> Config {
         let mut c = Config::default();
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
-            let Some((k, v)) = line.split_once('=') else { continue };
+            // `key = value` (this port's config.toml) or `key: value` (Chunky's config.yml, same keys).
+            let Some((k, v)) = line.split_once('=').or_else(|| line.split_once(':')) else { continue };
             let (k, v) = (k.trim(), v.trim().trim_matches('"'));
             match k {
                 "continue-on-restart" => c.continue_on_restart = v == "true",
@@ -123,6 +133,28 @@ enum Pending {
     Trim(TrimJob),
 }
 
+/// A trim the server runs while it is up: the chunks still to erase (`level.delete_chunks`), a few per tick.
+struct LiveTrim {
+    world: String,
+    dim: String,
+    todo: VecDeque<Chunk>,
+    /// Chunks that were loaded or held when their turn came, tried again later.
+    deferred: Vec<Chunk>,
+    total: usize,
+    erased: usize,
+    owner: String,
+    next_retry_ms: u64,
+    retries: u32,
+    /// After the first full pass the chunks left over go one per call, so the count says which one stayed.
+    retrying: bool,
+}
+
+/// Chunks one tick hands to the server's `delete_chunks` (its limit is 4096).
+const LIVE_TRIM_BATCH: usize = 512;
+/// How often chunks that were loaded are tried again, and how many rounds before the trim gives up on them.
+const LIVE_TRIM_RETRY_MS: u64 = 5_000;
+const LIVE_TRIM_ROUNDS: u32 = 120;
+
 struct Task {
     sel: Selection,
     run: Run,
@@ -142,6 +174,8 @@ struct Task {
     ticks: u64,
     last_ms: Option<u64>,
     last_msg_ms: Option<u64>,
+    /// When the last progress event for other mods went out (`GenerationProgressEvent`).
+    last_event_ms: Option<u64>,
     last_save_ms: u64,
     session_start: (u64, u64),
     current: Chunk,
@@ -175,6 +209,7 @@ impl Task {
             ticks: 0,
             last_ms: None,
             last_msg_ms: None,
+            last_event_ms: None,
             last_save_ms: 0,
             session_start: (done, elapsed_ms),
             current: (0, 0),
@@ -363,6 +398,16 @@ pub struct Engine {
     loaded: HashMap<String, HashSet<Chunk>>,
     /// Lines a background job (`debug map`) finished with, by the sender who asked (empty: console), taken by the glue.
     async_lines: Arc<Mutex<Vec<(String, String)>>>,
+    /// Whether the server can erase chunks while it runs (`delete_chunks`): a confirmed trim then starts at once
+    /// instead of waiting for the next start.
+    live_trim: bool,
+    live_trims: Vec<LiveTrim>,
+    /// ChunkyBorder's borders, its config and its players' state.
+    pub borders: Borders,
+    /// Events for the mods that subscribed to the API (`api::event_*`), taken by the glue.
+    api_events: Vec<String>,
+    /// The mod ids that receive them.
+    subscribers: Vec<String>,
 }
 
 impl Engine {
@@ -391,7 +436,76 @@ impl Engine {
             last_level_ms: 0,
             loaded: HashMap::new(),
             async_lines: Arc::new(Mutex::new(Vec::new())),
+            live_trim: false,
+            live_trims: Vec::new(),
+            borders: Borders::default(),
+            api_events: Vec::new(),
+            subscribers: Vec::new(),
         }
+    }
+
+    /// The glue says the server can erase chunks while it runs.
+    pub fn set_live_trim(&mut self, on: bool) {
+        self.live_trim = on;
+    }
+
+    /// The next chunks of the live trim of `dim` to erase: up to 512 that are not loaded now (`loaded` is what the
+    /// glue knows of the dimension). Chunks that are loaded wait and come round again every 5 s.
+    pub fn take_live_trim_batch(&mut self, dim: &str, now_ms: u64) -> Vec<Chunk> {
+        let Some(t) = self.live_trims.iter_mut().find(|t| t.dim == dim) else { return Vec::new() };
+        if t.todo.is_empty() && !t.deferred.is_empty() && now_ms >= t.next_retry_ms {
+            t.todo = std::mem::take(&mut t.deferred).into();
+            t.next_retry_ms = now_ms + LIVE_TRIM_RETRY_MS;
+            t.retries += 1;
+            t.retrying = true;
+        }
+        let loaded = self.loaded.get(dim);
+        let mut batch = Vec::new();
+        let size = if t.retrying { 1 } else { LIVE_TRIM_BATCH };
+        while batch.len() < size {
+            let Some(c) = t.todo.pop_front() else { break };
+            if loaded.is_some_and(|l| l.contains(&c)) {
+                if t.deferred.is_empty() && t.next_retry_ms == 0 {
+                    t.next_retry_ms = now_ms + LIVE_TRIM_RETRY_MS;
+                }
+                t.deferred.push(c);
+            } else {
+                batch.push(c);
+            }
+        }
+        batch
+    }
+
+    /// What `delete_chunks` answered for `batch` (None: refused). A shortfall puts the whole batch back (erasing a
+    /// chunk again is harmless); the lines are for the console and the sender who confirmed.
+    pub fn live_trim_done(&mut self, dim: &str, batch: &[Chunk], erased: Option<usize>) {
+        let Some(i) = self.live_trims.iter().position(|t| t.dim == dim) else { return };
+        let t = &mut self.live_trims[i];
+        if erased == Some(batch.len()) {
+            t.erased += batch.len();
+        } else {
+            t.deferred.extend_from_slice(batch);
+        }
+        if !t.todo.is_empty() {
+            return;
+        }
+        let gave_up = t.retries >= LIVE_TRIM_ROUNDS;
+        if !t.deferred.is_empty() && !gave_up {
+            return;
+        }
+        let t = self.live_trims.remove(i);
+        let left = t.deferred.len();
+        let line = if left == 0 {
+            pre(format!("Trim of {} finished: {} of {} chunks erased. Restart the server fully when you are ready.", display_world(&t.world), t.erased, t.total))
+        } else {
+            pre(format!(
+                "Trim of {} stopped: {} of {} chunks erased, {left} stayed loaded or held; run the trim again later.",
+                display_world(&t.world),
+                t.erased,
+                t.total
+            ))
+        };
+        self.async_lines.lock().unwrap_or_else(|e| e.into_inner()).push((t.owner, line));
     }
 
     /// The lines background jobs finished with since the last call: (sender, line), an empty sender being the console.
@@ -407,6 +521,87 @@ impl Engine {
     pub fn set_base(&mut self, base: PathBuf) {
         self.dir = Some(base.join("tasks"));
         self.base = Some(base);
+    }
+
+    /// ChunkyBorder's folder (`config/chunkyborder`): its config and `borders.json` are read now.
+    pub fn set_border_dir(&mut self, dir: &std::path::Path) {
+        self.borders = Borders::load(dir);
+    }
+
+    /// The events for subscribed mods since the last call, as `api` writes them.
+    pub fn take_api_events(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.api_events)
+    }
+
+    pub fn subscribers(&self) -> &[String] {
+        &self.subscribers
+    }
+
+    pub fn subscribe(&mut self, id: &str) {
+        if !self.subscribers.iter().any(|s| s == id) {
+            self.subscribers.push(id.to_owned());
+        }
+    }
+
+    pub fn unsubscribe(&mut self, id: &str) {
+        self.subscribers.retain(|s| s != id);
+    }
+
+    /// `ChunkyAPI.isRunning`: a task is running in the world.
+    pub fn api_is_running(&self, world: &str) -> bool {
+        canon_world(world).is_some_and(|w| self.tasks.get(w).is_some_and(|t| t.run == Run::Running))
+    }
+
+    /// `ChunkyAPI.startTask`: false for an unknown world or one with a running task. An unknown shape is a square, an
+    /// unknown pattern the ring, as Chunky's factories fall back.
+    pub fn api_start(&mut self, world: &str, shape: &str, cx: f64, cz: f64, rx: f64, rz: f64, pattern: &str) -> bool {
+        let Some(w) = canon_world(world).map(str::to_owned) else { return false };
+        if self.api_is_running(&w) {
+            return false;
+        }
+        let sel = Selection {
+            shape: Shape::parse(shape).unwrap_or(Shape::Square),
+            pattern: Pattern::parse(pattern, None).unwrap_or(Pattern::Ring),
+            cx,
+            cz,
+            radius: rx,
+            radius_z: rz,
+        };
+        self.sender.clear();
+        self.start_task(&w, sel);
+        self.tasks.contains_key(&w)
+    }
+
+    /// `ChunkyAPI.pauseTask`: false when no task is running there.
+    pub fn api_pause(&mut self, world: &str) -> bool {
+        let Some(w) = canon_world(world).map(str::to_owned) else { return false };
+        if !self.api_is_running(&w) {
+            return false;
+        }
+        self.pause_one(&w);
+        true
+    }
+
+    /// `ChunkyAPI.continueTask`: resumes the world's paused task.
+    pub fn api_continue(&mut self, world: &str) -> bool {
+        let Some(w) = canon_world(world).map(str::to_owned) else { return false };
+        if !self.tasks.get(&w).is_some_and(|t| t.run == Run::Paused) {
+            return false;
+        }
+        self.sender.clear();
+        let names = [w.as_str()];
+        self.cmd_continue(&names);
+        true
+    }
+
+    /// `ChunkyAPI.cancelTask`: drops the world's running task for good.
+    pub fn api_cancel(&mut self, world: &str) -> bool {
+        let Some(w) = canon_world(world).map(str::to_owned) else { return false };
+        if !self.api_is_running(&w) {
+            return false;
+        }
+        self.cancel_now(Some(&w));
+        true
     }
 
     /// The open world's folder (the glue's `native_world_dir`).
@@ -532,6 +727,11 @@ impl Engine {
         }
     }
 
+    /// Whether a live trim of `dim` still has chunks to erase.
+    pub fn live_trim_active(&self, dim: &str) -> bool {
+        self.live_trims.iter().any(|t| t.dim == dim)
+    }
+
     pub fn any_running_in(&self, dim: &str) -> bool {
         self.tasks.iter().any(|(w, _)| dimension_of(w) == dim)
     }
@@ -571,6 +771,7 @@ impl Engine {
         let over_budget = self.last_level_ms > cfg.tick_budget_ms;
         let mut finished = Vec::new();
         let mut save = Vec::new();
+        let mut api_events = Vec::new();
         let already = self.loaded.get(dim);
         let world_dir = self.world_dir.clone();
         for (w, t) in self.tasks.iter_mut().filter(|(w, _)| dimension_of(w) == dim) {
@@ -666,8 +867,14 @@ impl Engine {
                     out.notify.push((owner.clone(), line.clone()));
                 }
                 out.log.push(line);
+                api_events.push(api::progress_event(w, t.done, true, t.percent(), t.elapsed_ms, t.rate(), t.current));
+                api_events.push(api::complete_event(w, &t.sel, t.owner.as_deref(), t.total, t.elapsed_ms, "COMPLETED"));
                 finished.push(w.clone());
                 continue;
+            }
+            if t.last_event_ms.is_none_or(|m| now_ms.saturating_sub(m) >= cfg.update_interval * 1000) {
+                t.last_event_ms = Some(now_ms);
+                api_events.push(api::progress_event(w, t.done, false, t.percent(), t.elapsed_ms, t.rate(), t.current));
             }
             let due = t.last_msg_ms.is_none_or(|m| now_ms.saturating_sub(m) >= cfg.update_interval * 1000);
             if due && !cfg.silent {
@@ -679,6 +886,7 @@ impl Engine {
                 save.push(w.clone());
             }
         }
+        self.api_events.append(&mut api_events);
         for w in save {
             if let Some(t) = self.tasks.get(&w) {
                 self.save(&w, false, t);
@@ -769,6 +977,7 @@ impl Engine {
             "trim" => self.cmd_trim(rest, now_ms),
             "confirm" => self.cmd_confirm(now_ms),
             "reload" => self.cmd_reload(rest),
+            "border" => self.cmd_border(rest, who),
             "limit" => self.cmd_limit(rest),
             "debug" => match rest.first().map(|s| s.to_ascii_lowercase()).as_deref() {
                 Some("map") => self.cmd_debug_map(),
@@ -918,6 +1127,7 @@ impl Engine {
             self.release_later.entry(w.to_owned()).or_default().extend(held);
         }
         self.save(w, false, &t);
+        self.api_events.push(api::start_event(w, &t.sel, t.owner.as_deref(), false));
         self.tasks.insert(w.to_owned(), t);
         vec![pre(format!(
             "Task started in {} for the {} region centered at {}, {} with radius {}.",
@@ -951,6 +1161,7 @@ impl Engine {
         if let Some(t) = self.tasks.get_mut(w) {
             if t.run == Run::Running {
                 self.console.push(pre(format!("Task stopped for {}.", display_world(w))));
+                self.api_events.push(api::complete_event(w, &t.sel, t.owner.as_deref(), t.done, t.elapsed_ms, "PAUSED"));
             }
             t.run = Run::Paused;
             let held = t.rewind();
@@ -983,6 +1194,7 @@ impl Engine {
                         t.owner = Some(sender.clone());
                     }
                     t.session_start = (t.done, t.elapsed_ms);
+                    self.api_events.push(api::start_event(&w, &t.sel, t.owner.as_deref(), true));
                     out.push(pre(format!("Task continuing for {}.", display_world(&w))));
                 }
             }
@@ -1030,6 +1242,7 @@ impl Engine {
                 if t.run == Run::Running {
                     self.console.push(pre(format!("Task stopped for {}.", display_world(&w))));
                 }
+                self.api_events.push(api::complete_event(&w, &t.sel, t.owner.as_deref(), t.done, t.elapsed_ms, "CANCELLED"));
                 let held = t.rewind();
                 self.release_later.entry(w.clone()).or_default().extend(held);
                 self.save(&w, true, &t);
@@ -1045,6 +1258,7 @@ impl Engine {
                 if t.run == Run::Running {
                     self.console.push(pre(format!("Task stopped for {}.", display_world(&w))));
                 }
+                self.api_events.push(api::complete_event(&w, &t.sel, t.owner.as_deref(), t.done, t.elapsed_ms, "CANCELLED"));
                 let held = t.rewind();
                 self.release_later.entry(w.clone()).or_default().extend(held);
                 self.save(&w, true, &t);
@@ -1257,7 +1471,9 @@ impl Engine {
     fn cmd_trim(&mut self, rest: &[&str], now_ms: u64) -> Vec<String> {
         if rest.len() == 1 && rest[0].eq_ignore_ascii_case("abort") {
             self.pending.remove(&self.sender);
-            let gone = self.base.as_ref().is_some_and(|b| std::fs::remove_file(b.join(trim::PENDING)).is_ok());
+            let live = !self.live_trims.is_empty();
+            self.live_trims.clear();
+            let gone = self.base.as_ref().is_some_and(|b| std::fs::remove_file(b.join(trim::PENDING)).is_ok()) || live;
             let line = if gone { "[Chunky] The scheduled trim is called off." } else { "[Chunky] No trim is scheduled." };
             return vec![line.into()];
         }
@@ -1313,8 +1529,12 @@ impl Engine {
             p.files_deleted,
             p.files_changed
         )));
-        out.push(pre("This cannot be undone without a backup. It runs at the next server start, before the world loads."));
-        out.push(pre(format!("Type '/chunky confirm' within {} s to schedule it.", CONFIRM_MS / 1000)));
+        out.push(pre(if self.live_trim {
+            "This cannot be undone without a backup. It runs now, a few chunks per tick."
+        } else {
+            "This cannot be undone without a backup. It runs at the next server start, before the world loads."
+        }));
+        out.push(pre(format!("Type '/chunky confirm' within {} s to {} it.", CONFIRM_MS / 1000, if self.live_trim { "start" } else { "schedule" })));
         out.extend(p.errors.iter().map(|e| pre(format!("Could not read {e}"))));
         self.pending.insert(self.sender.clone(), (Pending::Trim(job), now_ms + CONFIRM_MS));
         out
@@ -1332,7 +1552,40 @@ impl Engine {
         }
     }
 
+    /// A confirmed trim on a server that erases chunks while it runs: the chunks go a few per tick.
+    fn start_live_trim(&mut self, job: TrimJob) -> Vec<String> {
+        let dim = dimension_of(&job.world).to_owned();
+        if self.live_trims.iter().any(|t| t.dim == dim) {
+            return vec![pre(format!("A trim of {} is already running. '/chunky trim abort' stops it.", display_world(&job.world)))];
+        }
+        let todo: VecDeque<Chunk> = job.doomed().into();
+        let total = todo.len();
+        let line = pre(format!(
+            "Trim of {} started: {total} saved chunks are erased, a few per tick; chunks that are loaded wait until they unload.",
+            display_world(&job.world)
+        ));
+        if total == 0 {
+            return vec![pre(format!("Nothing to trim in {}.", display_world(&job.world)))];
+        }
+        self.live_trims.push(LiveTrim {
+            world: job.world,
+            dim,
+            todo,
+            deferred: Vec::new(),
+            total,
+            erased: 0,
+            owner: self.sender.clone(),
+            next_retry_ms: 0,
+            retries: 0,
+            retrying: false,
+        });
+        vec![line]
+    }
+
     fn schedule_trim(&mut self, job: TrimJob) -> Vec<String> {
+        if self.live_trim {
+            return self.start_live_trim(job);
+        }
         let Some(base) = self.base.clone() else { return vec![pre("The config folder is not known yet.")] };
         let _ = std::fs::create_dir_all(&base);
         match std::fs::write(base.join(trim::PENDING), trim::render(&job)) {
@@ -1359,10 +1612,120 @@ impl Engine {
         out
     }
 
+    /// `border <add|remove|wrap|list|load|bypass|help>` (ChunkyBorder's `BorderCommand`): anything else is its help line.
+    fn cmd_border(&mut self, rest: &[&str], who: &Who) -> Vec<String> {
+        let help = vec![help_line("border")];
+        let Some((sub, args)) = rest.split_first() else { return help };
+        match sub.to_ascii_lowercase().as_str() {
+            "add" => {
+                // The selection takes `[world] [shape] [x z] [radius] [z radius]` as `start` reads them; every
+                // wrong word answers with the border help.
+                if self.apply_area(args, "").is_err() {
+                    return help;
+                }
+                let (sel, w) = (self.selection.clone(), self.selected_world.clone());
+                self.borders.add(BorderData { world: w.clone(), shape: sel.shape, cx: sel.cx, cz: sel.cz, rx: sel.radius, rz: sel.radius_z, wrap: Wrap::None });
+                vec![pre(format!(
+                    "Added {} world border to {} with center {}, {}, and radius {}.",
+                    sel.shape.name(),
+                    display_world(&w),
+                    number(sel.cx),
+                    number(sel.cz),
+                    radius_text(&sel)
+                ))]
+            }
+            "remove" => {
+                if !self.border_world(args) {
+                    return help;
+                }
+                let w = self.selected_world.clone();
+                if self.borders.remove(&w) {
+                    vec![pre(format!("Removed world border from {}.", display_world(&w)))]
+                } else {
+                    vec![pre(format!("No world border exists for {}.", display_world(&w)))]
+                }
+            }
+            "load" => {
+                if !self.border_world(args) {
+                    return help;
+                }
+                let w = self.selected_world.clone();
+                let Some(b) = self.borders.get(&w).cloned() else {
+                    return vec![pre(format!("No world border exists for {}.", display_world(&w)))];
+                };
+                self.selection.shape = b.shape;
+                self.selection.cx = b.cx;
+                self.selection.cz = b.cz;
+                self.selection.radius = b.rx;
+                self.selection.radius_z = b.rz;
+                vec![pre(format!("Selection loaded from world border for {}.", display_world(&w)))]
+            }
+            "list" => {
+                if self.borders.all().next().is_none() {
+                    return vec![pre("There are no world borders.")];
+                }
+                let mut out = vec![pre("World Borders")];
+                for b in self.borders.all() {
+                    out.push(format!(
+                        "{}: {} with center {}, {} and radius {}.",
+                        display_world(&b.world),
+                        b.shape.name(),
+                        number(b.cx),
+                        number(b.cz),
+                        radius_text(&b.selection())
+                    ));
+                }
+                out
+            }
+            "wrap" => {
+                let w = self.selected_world.clone();
+                if self.borders.get(&w).is_none() {
+                    return vec![pre(format!("No world border exists for {}.", display_world(&w)))];
+                }
+                let wrap = args.first().map_or(Wrap::None, |s| Wrap::parse(s));
+                self.borders.set_wrap(&w, wrap);
+                vec![pre(format!("World border wrap changed to {} for {}.", wrap.name(), display_world(&w)))]
+            }
+            "bypass" => {
+                let target = match args.first() {
+                    Some(name) => self.borders.player_named(name),
+                    None if who.sender.is_empty() => return Vec::new(),
+                    None => self.borders.player_named(&who.sender),
+                };
+                let Some((name, id)) = target else {
+                    return match args.first() {
+                        Some(name) => vec![pre(format!("Cannot find a player by the name {name}."))],
+                        None => Vec::new(),
+                    };
+                };
+                let on = !self.borders.is_bypassing(id);
+                self.borders.set_bypassing(id, on);
+                vec![pre(format!("Temporary border bypass {} for {}.", if on { "enabled" } else { "disabled" }, name))]
+            }
+            _ => help,
+        }
+    }
+
+    /// The optional world word of `border remove` and `border load`: it selects the world; false for an unknown one.
+    fn border_world(&mut self, args: &[&str]) -> bool {
+        match args.first() {
+            Some(name) => match canon_world(name) {
+                Some(w) => {
+                    self.selected_world = w.into();
+                    true
+                }
+                None => false,
+            },
+            None => true,
+        }
+    }
+
     fn reload_config(&mut self) -> Vec<String> {
         let Some(base) = self.base.clone() else { return vec![pre("The config folder is not known yet.")] };
-        self.cfg = std::fs::read_to_string(base.join("config.toml")).map(|t| Config::parse(&t)).unwrap_or_default();
+        self.cfg = read_config(&base);
         crate::horizon_chunky_core::lang::set_language(&self.cfg.language);
+        // ChunkyBorder listens to Chunky's reload: its config and its borders are read again.
+        self.borders.reload();
         Vec::new()
     }
 
@@ -1561,6 +1924,7 @@ fn help_line(name: &str) -> String {
 
 fn help_plain(name: &str) -> &'static str {
     match name {
+        "border" => "chunky border <add|remove|wrap|list|load|bypass> - Manage custom world borders",
         "cancel" => "chunky cancel - Stop and delete current or saved tasks",
         "center" => "chunky center <x> <z> - Set the center block location",
         "continue" => "chunky continue - Continue current or saved tasks",
@@ -1587,7 +1951,7 @@ fn help_plain(name: &str) -> &'static str {
 
 /// Chunky's help menu (`HelpCommand`): every command for the console; eight to a page for a player.
 fn help(page: Option<i64>, player: bool) -> Vec<String> {
-    const LISTED: [&str; 19] = [
+    const LISTED: [&str; 20] = [
         "start",
         "pause",
         "continue",
@@ -1606,6 +1970,7 @@ fn help(page: Option<i64>, player: bool) -> Vec<String> {
         "trim",
         "selection",
         "progress",
+        "border",
         "reload",
     ];
     let last = LISTED.len() / 8;
@@ -1864,6 +2229,12 @@ mod tests {
     }
 
     #[test]
+    fn config_parses_chunky_yml() {
+        let c = Config::parse("# Chunky Configuration\nversion: 2\nlanguage: de\ncontinue-on-restart: true\nforce-load-existing-chunks: true\nsilent: true\nupdate-interval: 5\n");
+        assert!(c.continue_on_restart && c.force_load_existing_chunks && c.silent && c.update_interval == 5 && c.language == "de");
+    }
+
+    #[test]
     fn config_parses_the_toml_subset() {
         let c = Config::parse("# c\ncontinue-on-restart = true\nupdate-interval = 30 # s\nsilent = false\nmax-in-flight = 9\n");
         assert!(c.continue_on_restart && c.update_interval == 30 && c.max_in_flight == 9);
@@ -2004,6 +2375,38 @@ mod tests {
         assert!(e.command("chunky trim abort", &who, 0)[0].contains("called off"));
         assert!(!base.join(trim::PENDING).exists());
         assert!(e.command("chunky trim world square 0 0 16 16 sideways", &who, 0)[0].contains("chunky trim"));
+        let _ = std::fs::remove_dir_all(d);
+    }
+
+    #[test]
+    fn a_live_trim_erases_in_batches_and_waits_for_loaded_chunks() {
+        let d = world_with_region("livetrim", &[(0, "minecraft:full"), (500, "minecraft:full"), (501, "minecraft:full")]);
+        let mut e = engine(None);
+        e.set_base(d.join("config/chunky"));
+        e.set_world_dir(Some(d.clone()));
+        e.set_live_trim(true);
+        let who = Who::default();
+        let r = e.command("chunky trim world square 0 0 16 16 outside", &who, 0);
+        assert!(r.iter().any(|l| l.contains("runs now")), "{r:?}");
+        assert!(e.command("chunky confirm", &who, 1000)[0].contains("started: 2 saved chunks"));
+        assert!(!d.join("config/chunky").join(trim::PENDING).exists(), "a live trim writes no pending file");
+        e.chunk_loaded("minecraft:overworld", (20, 15));
+        let batch = e.take_live_trim_batch("minecraft:overworld", 2000);
+        assert_eq!(batch.len(), 1, "the loaded chunk waits");
+        e.live_trim_done("minecraft:overworld", &batch, Some(1));
+        assert!(e.take_async().is_empty());
+        assert!(e.take_live_trim_batch("minecraft:overworld", 3000).is_empty(), "retry only after 5 s");
+        e.chunk_unloaded("minecraft:overworld", (20, 15));
+        let again = e.take_live_trim_batch("minecraft:overworld", 8000);
+        assert_eq!(again, [(20, 15)]);
+        // The server erased fewer than it was given: the batch comes back.
+        e.live_trim_done("minecraft:overworld", &again, Some(0));
+        assert!(e.take_async().is_empty());
+        let third = e.take_live_trim_batch("minecraft:overworld", 20_000);
+        e.live_trim_done("minecraft:overworld", &third, Some(1));
+        let lines = e.take_async();
+        assert!(lines[0].1.contains("finished: 2 of 2 chunks erased"), "{lines:?}");
+        assert!(e.take_live_trim_batch("minecraft:overworld", 30_000).is_empty());
         let _ = std::fs::remove_dir_all(d);
     }
 
@@ -2158,5 +2561,95 @@ mod tests {
             f.notices(),
             ["[Chunky] &eNotice: Filtering chunks that have not been modified in the last 2 days. Chunks without a known modification time will not be deleted."]
         );
+    }
+    #[test]
+    fn border_add_list_load_wrap_and_remove_answer_in_chunkys_lines() {
+        let mut e = engine(None);
+        let w = Who::default();
+        let say = |e: &mut Engine, line: &str| e.command(line, &Who::default(), 0);
+        assert_eq!(say(&mut e, "chunky border list"), ["[Chunky] There are no world borders."]);
+        assert_eq!(
+            say(&mut e, "chunky border add world circle 10 -20 500"),
+            ["[Chunky] Added circle world border to world with center 10, -20, and radius 500."]
+        );
+        assert_eq!(
+            say(&mut e, "chunky border add world_nether rectangle 0 0 100 50"),
+            ["[Chunky] Added rectangle world border to world_nether with center 0, 0, and radius 100, 50."]
+        );
+        // `add` writes the selection, as the add-on does.
+        assert_eq!((e.selection.shape, e.selection.radius, e.selected_world.as_str()), (Shape::Rectangle, 100.0, "world_nether"));
+        assert_eq!(
+            say(&mut e, "chunky border list"),
+            ["[Chunky] World Borders", "world: circle with center 10, -20 and radius 500.", "world_nether: rectangle with center 0, 0 and radius 100, 50."]
+        );
+        assert_eq!(say(&mut e, "chunky border wrap"), ["[Chunky] World border wrap changed to none for world_nether."]);
+        assert_eq!(say(&mut e, "chunky border wrap earth"), ["[Chunky] World border wrap changed to earth for world_nether."]);
+        assert_eq!(e.borders.get("world_nether").unwrap().wrap, Wrap::Earth);
+        // A border added again keeps its wrap; `load` copies a border into the selection.
+        say(&mut e, "chunky border add world_nether square 0 0 80");
+        assert_eq!(e.borders.get("world_nether").unwrap().wrap, Wrap::Earth);
+        assert_eq!(say(&mut e, "chunky border load world"), ["[Chunky] Selection loaded from world border for world."]);
+        assert_eq!((e.selection.shape, e.selection.cx, e.selection.cz, e.selection.radius), (Shape::Circle, 10.0, -20.0, 500.0));
+        assert_eq!(say(&mut e, "chunky border remove world"), ["[Chunky] Removed world border from world."]);
+        assert_eq!(say(&mut e, "chunky border remove world"), ["[Chunky] No world border exists for world."]);
+        assert_eq!(say(&mut e, "chunky border load world"), ["[Chunky] No world border exists for world."]);
+        // Wrong words answer with the border help; a missing word too.
+        let help = vec!["&2chunky border <add|remove|wrap|list|load|bypass>&r - Manage custom world borders".to_owned()];
+        assert_eq!(say(&mut e, "chunky border add narnia"), help);
+        assert_eq!(say(&mut e, "chunky border add world blob"), help);
+        assert_eq!(say(&mut e, "chunky border add world circle 5"), help);
+        assert_eq!(say(&mut e, "chunky border"), help);
+        assert_eq!(say(&mut e, "chunky border help"), help);
+        let _ = w;
+    }
+
+    #[test]
+    fn border_bypass_toggles_the_senders_or_a_named_players_switch() {
+        let mut e = engine(None);
+        e.borders.set_online(&[("Alex".to_owned(), 1), ("Sam".to_owned(), 2)]);
+        let alex = Who { sender: "alex".into(), ..Default::default() };
+        assert_eq!(e.command("chunky border bypass", &alex, 0), ["[Chunky] Temporary border bypass enabled for Alex."]);
+        assert!(e.borders.is_bypassing(1));
+        assert_eq!(e.command("chunky border bypass sam", &alex, 0), ["[Chunky] Temporary border bypass enabled for Sam."]);
+        assert_eq!(e.command("chunky border bypass", &alex, 0), ["[Chunky] Temporary border bypass disabled for Alex."]);
+        assert_eq!(e.command("chunky border bypass bob", &alex, 0), ["[Chunky] Cannot find a player by the name bob."]);
+        // The console has no switch of its own.
+        assert!(e.command("chunky border bypass", &Who::default(), 0).is_empty());
+    }
+
+    #[test]
+    fn the_help_menu_lists_border_before_reload() {
+        let lines = e_help();
+        let border = lines.iter().position(|l| l.contains("chunky border")).unwrap();
+        assert!(lines[border + 1].contains("chunky reload"));
+        assert_eq!(lines.len(), 21, "title and twenty commands for the console");
+    }
+
+    fn e_help() -> Vec<String> {
+        help(None, false)
+    }
+
+    #[test]
+    fn a_task_finishing_tells_subscribers_progress_then_completion() {
+        let mut e = engine(None);
+        e.subscribe("mapper");
+        e.command("chunky start world square 0 0 8", &Who::default(), 0);
+        let mut events = e.take_api_events();
+        assert!(events[0].starts_with("generation_start\tworld\tsquare\t0\t0\t8"), "{}", events[0]);
+        events.clear();
+        for n in 0..400u64 {
+            let a = e.tick("minecraft:overworld", n * 50);
+            for c in a.hold {
+                e.chunk_loaded("minecraft:overworld", c);
+            }
+            events.extend(e.take_api_events());
+            if e.tasks.is_empty() {
+                break;
+            }
+        }
+        assert!(events.iter().any(|l| l.starts_with("generation_progress\tworld\t") && l.contains("\tfalse\t")), "{events:?}");
+        let n = events.len();
+        assert!(events[n - 2].starts_with("generation_progress\tworld\t") && events[n - 2].contains("\ttrue\t100"), "{events:?}");
+        assert!(events[n - 1].starts_with("generation_complete\tworld\tsquare") && events[n - 1].ends_with("\tCOMPLETED"), "{events:?}");
     }
 }

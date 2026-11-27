@@ -9,4 +9,3 @@ publish = false
 horizon-mod-api = { path = ".horizon/sdk/api/crates/horizon-mod-api" }
 # The version in the Horizon Cargo.lock the bundle targets (region files are zlib or gzip).
 flate2 = "1.1"
-

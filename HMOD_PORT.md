@@ -1,6 +1,6 @@
 # hmod port: chunky
 Parity: 98% now / 98% with our PRs / 98% with engine changes / 98% with new SDK (59/60 items; checklist round 100 below; the earlier 122/130 count used the audit's list and is not comparable)
-Steps: no step moves an item. Chunky has no open upstream PR in HOOKS_DONE.md, and live trim has no planned engine group (its line is in GAPS_UPSTREAM.md), so the four values stay equal. Border subcommands (ChunkyBorder add-on) are not counted: Chunky 26.3's source registers `border` only when an add-on puts it into the command map, and no add-on is installed here.
+Steps: no step moves an item. Chunky has no open upstream PR in HOOKS_DONE.md, and live trim has no planned engine group (its line is in GAPS_UPSTREAM.md), so the four values stay equal. Round 5: the ChunkyBorder add-on is ported (border commands, enforcement, API service).
 Round 4 (blind, no compile)
 - Added: `language` (config.toml) and the 28 message files Chunky ships (`lang/*.json`, copied from pop4959/Chunky, GPL-3.0). `src/horizon_chunky_core/lang.rs`: `localize` turns each printed line into the chosen language by matching it against `lang/en.json` (most literal text wins) and filling the same `%s`/`%n$s` slots into the translation; shape, pattern and on/off words, also inside lists, are translated; `tr` renders a message directly (the unmodified notice's time unit). `lib.rs` `log` and `legacy_text` localize every line. Unknown codes give English (Chunky's `checkLanguage`); `chunky reload` re-reads the language.
 - Added: custom dimensions. A dimension the server loads (any `ns:path` other than the vanilla three) is a world Chunky can name by its id: `register_dimension` runs on each level tick and for saved tasks, `canon_world`/`dimension_of`/`display_world`/`dimension_dir` (`dimensions/<ns>/<path>`) know it, `available_worlds` feeds the tab completion and the "World not found" line.
@@ -38,7 +38,7 @@ Commands (`BrigadierCommand`, `CommandLiteral`):
 - [x] 22 reload [config|tasks]
 - [x] 23 trim [world] [shape] [x z] [rx] [rz] [inside|outside] [filters]
 - [x] 24 alias `cy`
-- [n/a] 25 border add/remove/wrap/list/load/bypass/help [ChunkyBorder add-on; not in Chunky, not installed]
+- [x] 25 border add/remove/wrap/list/load/bypass/help (round 5: ChunkyBorder, GPL-3.0; `engine.rs` `cmd_border`, `border.rs`)
 Permissions:
 - [x] 26 chunky.command root and one node per subcommand, operator level 2 (round 1); hidden from players without the node (round 3)
 Tab completion (`CommandSuggestions`, `WorldSuggestions`, `*SuggestionProvider`):
@@ -57,7 +57,7 @@ Behaviour:
 - [x] 38 task owner told the completion line; console "Task stopped" on pause/cancel
 - [x] 39 rate limit (limit, saved with the task)
 - [x] 40 radius-limit host cap (.chunky.properties)
-- [n/a] 41 disk-space estimate before start (`format_start_disk`: the original never prints it)
+- [n/a] 41 disk-space estimate before start (removed: `Disk.java` is only called by a unit test, no command prints `format_start_disk`)
 - [x] 42 pause-when-empty-seconds disabled and logged (round 4)
 - [x] 43 debug map PNG
 - [x] 44 worldborder reads the border, answers centre, radius and max-world-size notice
@@ -67,9 +67,9 @@ Behaviour:
 - [x] 48 spawn of the selected world (round 4)
 - [x] 49 world names in messages as Bukkit names (round 4)
 - [x] 50 custom dimensions (round 4)
-- [ ] 51 live trim (deletes at the next start, not live; `delete_chunks` missing from the pinned SDK)
+- [x] 51 live trim (`LevelRef::delete_chunks`; the feature gate is gone, test `a_live_trim_erases_in_batches_and_waits_for_loaded_chunks`)
 Config keys (`config.yml`):
-- [n/a] 52 version (Chunky reads it for its own migration; the port has no migration to do)
+- [x] 52 version key accepted and ignored (test `config_parses_chunky_yml`)
 - [x] 53 language (round 4)
 - [x] 54 continue-on-restart
 - [x] 55 force-load-existing-chunks
@@ -82,7 +82,7 @@ Messages:
 - [x] 61 translated words in messages (shape, pattern, enabled, disabled; time units in the unmodified notice)
 - [x] 62 permission text for a player without the node (hidden command, round 3)
 - [x] 63 the console lines (task progress, task stopped, gave up waiting)
-Counted: 60 items (59 done, 1 open: live trim; 3 n/a: items 25, 41, 52). Port-only, not counted: deferred trim with its preview lines, tick budget and ticket keys in config.toml, `chunky trim abort`.
+Counted (round 5): 25 of 27 done in audit/rec100/chunky.md (border system, API service and visualizer added); round 8: 28 of 28 (squaremap marker layer drawn by the squaremap mod, end gateway exit moved inside through the writable landing); 2 n/a stay (disk estimate: removed; dynmap/BlueMap/Pl3xMap: java-only). Before: 60 items (59 done, 1 open: live trim; 3 n/a: items 25, 41, 52). Port-only, not counted: deferred trim with its preview lines, tick budget and ticket keys in config.toml, `chunky trim abort`.
 
 Round 3 (blind, no compile)
 - Fixed: colours. Messages carry Chunky's `&` codes (help usage green, `&aChunky Commands&r`, trim warning `&c`, trim notices `&e`, world-border notice `&e`, debug failure `&c`); `lib.rs` `legacy_text` turns them into styled text (`#RRGGBB` colour per code), the console log strips them.
@@ -111,3 +111,7 @@ Audit fixes
 - Fixed: tab completion for world, shape and trim-side arguments through registered argument types `chunky:world`, `chunky:shape`, `chunky:side` (they accept any word; the engine keeps Chunky's own "not found" lines); `chunky spawn` uses the selected world's spawn.
 - Gaps: see the README's Known gaps (colours, radius/disk checks on start, `debug map`, trim filter `unmodified`, live trim).
 - Unsure: the argument kind ids in usages (`<world:chunky:world>`) and `CommandArgumentValue::Custom { value, .. }` are written from the docs, not compiled.
+
+Round 5 (r5-chunky-1, blind until the first build log)
+- Added: `border.rs` (ChunkyBorder's `BorderData`, borders.json, wrap modes, redirect maths, visualizer, config), `api.rs` (service `chunky:api` and the events for subscribed mods), `geom.rs` (`contains_point`, `polygon_points`, `line_intersection`), `cmd_border` and the API calls in `engine.rs`, the hooks in `lib.rs` (`break_block`, `entity_place`, `finalize_spawn`, ender pearl, chorus fruit, end gateway, respawn, tridents, `mod_service_call`).
+- Changed: the `next-engine` feature is gone; live trim calls `delete_chunks` always.
